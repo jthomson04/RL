@@ -59,6 +59,7 @@ from nemo_rl.data.llm_message_utils import (
 )
 from nemo_rl.data.utils import extract_necessary_env_names
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.mx_helpers import MxConfig
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -1424,13 +1425,37 @@ def grpo_train(
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 
+    # ---- ModelExpress v2 weight-sync wiring (cfg.cluster.weight_sync) ----
+    # Read once at the top of training so we don't re-parse on every refit
+    # call. _weight_sync_method drives the dispatcher inside
+    # refit_policy_generation; _mx_config carries the MX server URL + picker
+    # flags through to both the trainer publisher and the inference receiver.
+    _weight_sync_cfg = (master_config.get("cluster") or {}).get("weight_sync", {}) or {}
+    _weight_sync_method = _weight_sync_cfg.get("method")
+    _mx_config = (
+        MxConfig.from_dict(_weight_sync_cfg.get("mx_config"))
+        if _weight_sync_method == "mx"
+        else None
+    )
+    if _weight_sync_method == "mx":
+        print(
+            f"  ✓ weight_sync.method='mx' (MxConfig: enabled={_mx_config.enabled}, "
+            f"server={_mx_config.mx_server_url}, same_rank_only={_mx_config.same_rank_only}, "
+            f"tree_scale_out={_mx_config.tree_scale_out})",
+            flush=True,
+        )
+
     NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
     if policy_generation is None:
         policy_generation = policy  # type: ignore
         NEED_REFIT = False
     elif master_config["policy"]["generation"].get("backend") == "dynamo":
-        NEED_REFIT = False
+        # Dynamo backend supports refit via weight_sync_method="mx" (the
+        # ModelExpress v2 NIXL RDMA path). Other refit methods aren't
+        # implemented for Dynamo and short-circuit here.
+        if _weight_sync_method != "mx":
+            NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None  # for mypy type check
 
@@ -1475,7 +1500,14 @@ def grpo_train(
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
         if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+                weight_sync_method=_weight_sync_method,
+                mx_config=_mx_config,
+                refit_version=0,
+            )
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
@@ -1591,6 +1623,9 @@ def grpo_train(
                             colocated_inference,
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
+                            weight_sync_method=_weight_sync_method,
+                            mx_config=_mx_config,
+                            refit_version=int(total_steps + 1),
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -1944,6 +1979,9 @@ def grpo_train(
                             policy_generation,
                             colocated_inference,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
+                            weight_sync_method=_weight_sync_method,
+                            mx_config=_mx_config,
+                            refit_version=int(total_steps + 1),
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -2519,6 +2557,17 @@ def async_grpo_train(
         fit_last_save_time=True,
     )
     timeout.start_iterations()
+
+    # ---- ModelExpress v2 weight-sync wiring (cfg.cluster.weight_sync) ----
+    # Read once so the per-refit call sites don't re-parse the config.
+    _weight_sync_cfg = (master_config.get("cluster") or {}).get("weight_sync", {}) or {}
+    _weight_sync_method = _weight_sync_cfg.get("method")
+    _mx_config = (
+        MxConfig.from_dict(_weight_sync_cfg.get("mx_config"))
+        if _weight_sync_method == "mx"
+        else None
+    )
+
     NEED_REFIT = True
 
     # Setup generation interface
@@ -2526,7 +2575,12 @@ def async_grpo_train(
         policy_generation = policy
         NEED_REFIT = False
     elif master_config["policy"]["generation"].get("backend") == "dynamo":
-        NEED_REFIT = False
+        # Dynamo backend supports refit via weight_sync_method="mx" (MX v2
+        # NIXL RDMA). Skip refit for other methods, which aren't implemented
+        # on the Dynamo path.
+        weight_sync_method = _weight_sync_method
+        if weight_sync_method != "mx":
+            NEED_REFIT = False
     POLICY_GENERATION_STALE = True
     assert policy_generation is not None
 
@@ -2651,7 +2705,14 @@ def async_grpo_train(
     if NEED_REFIT and POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...")
         try:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+                weight_sync_method=_weight_sync_method,
+                mx_config=_mx_config,
+                refit_version=0,
+            )
             print("✅ Policy generation refit completed successfully")
             POLICY_GENERATION_STALE = False
         except Exception as e:
@@ -2978,7 +3039,12 @@ def async_grpo_train(
                     print("🔄 Performing policy generation refit...")
                     with timer.time("weight_sync"):
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            weight_sync_method=_weight_sync_method,
+                            mx_config=_mx_config,
+                            refit_version=int(weight_version + 1),
                         )
                         POLICY_GENERATION_STALE = False
 
@@ -3004,7 +3070,12 @@ def async_grpo_train(
 
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            weight_sync_method=_weight_sync_method,
+                            mx_config=_mx_config,
+                            refit_version=int(weight_version),
                         )
                         POLICY_GENERATION_STALE = False
                     else:
