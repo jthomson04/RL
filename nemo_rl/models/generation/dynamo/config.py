@@ -51,6 +51,12 @@ class DynamoCfg(TypedDict, total=False):
     dynamo_namespace: NotRequired[str]
     worker_component: NotRequired[str]
 
+    # Dynamo Prometheus exporter knobs. When set + enabled=True, the rollout
+    # entrypoint spawns `maybe_start_dynamo_prometheus_monitor` to scrape
+    # the DGD's worker metrics endpoint(s) into a replayable export under
+    # the experiment log dir. See nemo_rl/models/generation/dynamo/monitoring.
+    prometheus_metrics: NotRequired[dict[str, Any]]
+
 
 class DynamoConfig(GenerationConfig):
     """GenerationConfig for the Dynamo k8s backend.

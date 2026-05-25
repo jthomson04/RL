@@ -1,0 +1,110 @@
+# DynamoGraphDeployment for Qwen3-30B-A3B-Instruct-2507 on a GB300 cluster.
+#
+# Two services:
+#   * Frontend (CPU only, lands on customer-cpu via nodeSelector)
+#   * 1x VllmDecodeWorker (1 GPU on a GB300 node)
+#
+# The model weights are resolved via the HuggingFace cache on PVC.
+# `HF_HOME` (set below) points at the user-owned cache where the snapshot
+# of Qwen3-30B-A3B-Instruct-2507 has been downloaded via
+#   huggingface-cli download Qwen/Qwen3-30B-A3B-Instruct-2507 --cache-dir <HF_HOME>
+# The HF_HOME default points at ruit's cache; switch to your user's
+# `hf_home` path. The DGD manifest is loaded as plain YAML so this path
+# is not user-parameterized.
+#
+# Image: jthomson04's arm64 + Blackwell build of the dynamo vllm-runtime
+# (same image as qwen3_4b_thinking_gb300.yaml).
+#
+# To run more than one decode worker (e.g. for full SWE-bench throughput),
+# override `services.VllmDecodeWorker.replicas` via the infra YAML's
+# `dynamo.serving.overrides` block — that path DOES get OmegaConf-merged.
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  # nrl-k8s overrides this from `dynamo.serving.name` in the infra YAML at apply time.
+  name: qwen3-30b-a3b-instruct-2507-gb300
+  annotations:
+    # Operator default queue ("dynamo") is rejected by the cluster's Kyverno
+    # admission webhook for this service account; backfill is allowed.
+    nvidia.com/kai-scheduler-queue: backfill
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      resources:
+        requests: {cpu: "2", memory: "4Gi"}
+        limits:   {cpu: "4", memory: "8Gi"}
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+          kubernetes.io/arch: arm64
+        mainContainer:
+          image: jwillthomson/dynamo-arm-rl-tokenize-endpoint-07c4f28:latest
+          workingDir: /workspace
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            # Non-empty args required to override the upstream image's CMD,
+            # otherwise the frontend re-parses '-m dynamo.frontend' as user
+            # input and crash-loops. Same workaround as qwen3_4b_thinking.
+            - --router-reset-states
+    VllmDecodeWorker:
+      componentType: worker
+      # 1 worker pod x 1 GPU = 1 GB300 (smoke baseline).
+      # Bump replicas + gpu + --tensor-parallel-size together for throughput.
+      replicas: 1
+      resources:
+        requests: {gpu: "1", memory: "128Gi"}
+        limits:   {gpu: "1", memory: "256Gi"}
+      extraPodSpec:
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-GB300
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          image: jwillthomson/dynamo-arm-rl-tokenize-endpoint-07c4f28:latest
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          command:
+            - python3
+            - -m
+            - dynamo.vllm
+          args:
+            - --model
+            - Qwen/Qwen3-30B-A3B-Instruct-2507
+            # Served name is the canonical HF id so nemo-gym sends the same
+            # `model` field regardless of whether the snapshot is on PVC or
+            # gets fetched from HF.
+            - --served-model-name
+            - Qwen/Qwen3-30B-A3B-Instruct-2507
+            - --tensor-parallel-size
+            - "1"
+            - --gpu-memory-utilization
+            - "0.90"
+            - --max-model-len
+            - "262144"
+            - --trust-remote-code
+            - --enforce-eager
+            # Dynamo-specific tool-call parser; vLLM's --tool-call-parser is
+            # server-only, but in Dynamo the worker handles tool parsing.
+            - --dyn-tool-call-parser
+            - hermes
+          env:
+            - name: DYN_HEALTH_CHECK_ENABLED
+              value: "false"
+            # HF_HOME is intentionally NOT set here — it points at the
+            # caller's per-user HF cache on PVC, which is not knowable
+            # in this manifest (loaded as plain YAML, no interpolation).
+            # The nrl-k8s path injects it from infra YAML's
+            # `dynamo.serving.overrides` as /mnt/rl-workspace/${user:}/hf_home.
+            # Bare `kubectl apply -f` of this DGD will fail to load weights
+            # unless the caller adds HF_HOME (or pre-stages the snapshot at
+            # the default ~/.cache/huggingface).
