@@ -1,0 +1,105 @@
+# DynamoGraphDeployment for the full SWE-bench Verified Qwen3-30B-A3B-Instruct-2507
+# rollout on a GB300 cluster.
+#
+# Two services:
+#   * Frontend (CPU only, lands on customer-cpu via nodeSelector)
+#   * 4x VllmDecodeWorker (2 GPUs each, tensor-parallel-size=2 — 8 GB300 total)
+#
+# Sizing rationale: matches jthomson04's 2026-05-19 production rollout. With
+# 4 workers handling concurrency in parallel, vllm is not the bottleneck for
+# the mini-swe-agent rollout — agent CPU work dominates per-sample wall time.
+# Single GB300 (144GB HBM) is enough to host the 30B-A3B MoE at TP=1, but
+# TP=2 trades a small per-token latency penalty for more KV cache headroom
+# under bursty concurrency (16 in-flight agents per actor).
+#
+# Image: jthomson04's arm64 + Blackwell build of the dynamo vllm-runtime
+# (same image as the smoke baseline `qwen3_30b_a3b_instruct_2507_gb300.yaml`).
+#
+# Weights resolve via the HuggingFace cache on PVC. `HF_HOME` is intentionally
+# NOT set here — it points at the caller's per-user HF cache on PVC, which is
+# not knowable in this manifest (loaded as plain YAML, no interpolation).
+# The nrl-k8s path injects it from infra YAML's `dynamo.serving.overrides`
+# as /mnt/rl-workspace/${user:}/hf_home.
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  # nrl-k8s overrides this from `dynamo.serving.name` in the infra YAML at apply time.
+  name: qwen3-30b-a3b-instruct-2507-gb300-full
+  annotations:
+    # Operator default queue ("dynamo") is rejected by the cluster's Kyverno
+    # admission webhook for this service account; backfill is allowed.
+    nvidia.com/kai-scheduler-queue: backfill
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      resources:
+        requests: {cpu: "2", memory: "4Gi"}
+        limits:   {cpu: "4", memory: "8Gi"}
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+          kubernetes.io/arch: arm64
+        mainContainer:
+          image: jwillthomson/dynamo-arm-rl-tokenize-endpoint-07c4f28:latest
+          workingDir: /workspace
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            # Non-empty args required to override the upstream image's CMD,
+            # otherwise the frontend re-parses '-m dynamo.frontend' as user
+            # input and crash-loops. Same workaround as qwen3_4b_thinking.
+            - --router-reset-states
+    VllmDecodeWorker:
+      componentType: worker
+      # 4 worker pods x 2 GPUs each = 8 GB300 total. TP=2 means each worker
+      # shards the model across both of its GPUs; replicas=4 provides the
+      # request-level parallelism that feeds concurrency=16 in mini_swe_agent.
+      replicas: 4
+      resources:
+        requests: {gpu: "2", memory: "128Gi"}
+        limits:   {gpu: "2", memory: "256Gi"}
+      extraPodSpec:
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-GB300
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          image: jwillthomson/dynamo-arm-rl-tokenize-endpoint-07c4f28:latest
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          command:
+            - python3
+            - -m
+            - dynamo.vllm
+          args:
+            - --model
+            - Qwen/Qwen3-30B-A3B-Instruct-2507
+            # Served name is the canonical HF id so nemo-gym sends the same
+            # `model` field regardless of whether the snapshot is on PVC or
+            # gets fetched from HF.
+            - --served-model-name
+            - Qwen/Qwen3-30B-A3B-Instruct-2507
+            - --tensor-parallel-size
+            - "2"
+            - --gpu-memory-utilization
+            - "0.90"
+            - --max-model-len
+            - "262144"
+            - --trust-remote-code
+            - --enforce-eager
+            # Dynamo-specific tool-call parser; vLLM's --tool-call-parser is
+            # server-only, but in Dynamo the worker handles tool parsing.
+            - --dyn-tool-call-parser
+            - hermes
+          env:
+            - name: DYN_HEALTH_CHECK_ENABLED
+              value: "false"
