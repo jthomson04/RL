@@ -48,7 +48,7 @@ EXPORT_METADATA_FILENAME = "metadata.json"
 EXPORT_README_FILENAME = "README.md"
 EXPORT_PROMETHEUS_CONFIG_FILENAME = "prometheus-offline.yml"
 DEFAULT_SERVICE_NAMES = ("vllmdecodeworker",)
-DEFAULT_METRIC_PREFIXES = ("dynamo_",)
+DEFAULT_METRIC_PREFIXES = ("dynamo_", "vllm:", "sglang:", "trtllm_", "DCGM_")
 DEFAULT_LABEL_KEYS = (
     "dynamo_component",
     "dynamo_endpoint",
@@ -66,6 +66,11 @@ def maybe_start_dynamo_prometheus_monitor(
     logger: "Logger",
 ) -> Optional["DynamoPrometheusMonitor"]:
     """Start local Dynamo Prometheus export when this run uses Dynamo."""
+    # Accept either a plain dict (unit tests + early call sites) or a
+    # Pydantic MasterConfig (production after the upstream TypedDict→BaseModel
+    # refactor, PR #2325). Coerce to dict for uniform access below.
+    if hasattr(master_config, "model_dump"):
+        master_config = master_config.model_dump()  # type: ignore[union-attr]
     generation_config = (
         master_config.get("policy", {}).get("generation", {})  # type: ignore[union-attr]
         or {}
@@ -698,12 +703,29 @@ def _resolve_metric_endpoints(
 
     endpoints = []
     for service_name in service_names:
-        service_name = str(service_name).lower()
+        # Each entry may be either "name" (uses default port) or
+        # "name:port" so recipes can mix backends serving metrics on
+        # different ports (e.g. vllmdecodeworker on 9090 and the
+        # Dynamo frontend on 8000).
+        raw = str(service_name).lower()
+        if ":" in raw:
+            name, _, port_str = raw.partition(":")
+            try:
+                service_port = int(port_str)
+            except ValueError:
+                service_port = port
+        else:
+            name, service_port = raw, port
         url = (
-            f"http://{dgd_name}-{service_name}.{namespace}.svc.cluster.local:"
-            f"{port}/metrics"
+            f"http://{dgd_name}-{name}.{namespace}.svc.cluster.local:"
+            f"{service_port}/metrics"
         )
-        endpoints.append((service_name, url))
+        endpoints.append((name, url))
+
+    extra_endpoints = prometheus_cfg.get("extra_endpoints")
+    if extra_endpoints:
+        endpoints.extend(_normalize_explicit_endpoints(extra_endpoints))
+
     return endpoints
 
 

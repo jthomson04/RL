@@ -22,11 +22,16 @@ _shared:
     - {name: NCCL_DEBUG,                    value: WARN}
     - {name: PYTHONPATH,                    value: "/opt/nemo-rl:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM"}
     - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+    # Force per-actor Ray venv rebuild from the PVC-mounted uv.lock at
+    # actor spawn; the baked image venv lags new deps introduced upstream
+    # (e.g. tensordict from data-plane transfer queue PR #2439).
+    - {name: NRL_FORCE_REBUILD_VENVS,       value: "true"}
   workerEnv: &shared_worker_env
     - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
     - {name: NCCL_DEBUG,                    value: WARN}
     - {name: PYTHONPATH,                    value: "/opt/nemo-rl:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM"}
     - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+    - {name: NRL_FORCE_REBUILD_VENVS,       value: "true"}
   headResources: &head_resources
     limits:   {cpu: "48",  memory: "128Gi"}
     requests: {cpu: "16",  memory: "64Gi"}
@@ -124,6 +129,16 @@ launch:
     # (e.g. mini_swe_simple_agent's `git ls-files`, NeMo-RL's container
     # fingerprint check). Wildcard-trust avoids running `chown` on PVC.
     git config --global --add safe.directory '*' >/dev/null 2>&1 || true
+
+    # The baked driver venv (/opt/nemo_rl_venv) was assembled at image-build
+    # time and lags the PVC-mounted uv.lock when new top-level deps land
+    # upstream (e.g. tensordict). `uv sync --frozen` reconciles the venv with
+    # the current uv.lock — fast no-op when already in sync, ~minutes the
+    # first time after an upstream dep bump.
+    if command -v uv >/dev/null 2>&1; then
+      echo "[setup] reconciling /opt/nemo_rl_venv with uv.lock"
+      uv sync --frozen 2>&1 | tail -5 || echo "[setup] uv sync nonzero exit (continuing)"
+    fi
 
     export PYTHONPATH=.:3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:3rdparty/Megatron-LM-workspace/Megatron-LM
     TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)

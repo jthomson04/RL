@@ -65,10 +65,13 @@ policy:
       tool_call_parser: "hermes"
       prometheus_metrics:
         enabled: true
-        service_names: ["vllmdecodeworker"]
+        service_names: ["vllmdecodeworker", "frontend:8000"]
+        extra_endpoints:
+          - name: dcgm
+            url: "http://nvidia-dcgm-exporter.gpu-operator.svc.cluster.local:9400/metrics"
         collection_interval: 10
         timeout: 5
-        metric_prefixes: ["dynamo_"]
+        include_histogram_buckets: true
         export:
           enabled: true
     colocated:

@@ -60,10 +60,10 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 
 def _materialize_dynamo_generation_config(config: MasterConfig) -> dict[str, Any]:
-    generation_config = config["policy"]["generation"]
-    generation_config["model_name"] = config["policy"]["model_name"]
+    generation_config = config.policy["generation"]
+    generation_config["model_name"] = config.policy["model_name"]
     vllm_cfg = generation_config.setdefault("vllm_cfg", {})
-    vllm_cfg.setdefault("max_model_len", config["policy"]["max_total_sequence_length"])
+    vllm_cfg.setdefault("max_model_len", config.policy["max_total_sequence_length"])
     return generation_config
 
 
@@ -103,25 +103,26 @@ def main() -> None:
         print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
-    config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
-    print(f"Using log directory: {config['logger']['log_dir']}")
+    config = OmegaConf.to_container(config, resolve=True)
+    config = MasterConfig(**config)
+    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
+    print(f"Using log directory: {config.logger['log_dir']}")
 
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
-    assert config["policy"]["generation"] is not None, (
+    tokenizer = get_tokenizer(config.policy["tokenizer"])
+    assert config.policy["generation"] is not None, (
         "A generation config is required for Dynamo rollout-only collection"
     )
-    config["policy"]["generation"] = configure_generation_config(
-        config["policy"]["generation"], tokenizer
+    config.policy["generation"] = configure_generation_config(
+        config.policy["generation"], tokenizer
     )
     generation_config = _materialize_dynamo_generation_config(config)
 
     setup_nemo_gym_config(config, tokenizer)
-    config["env"]["nemo_gym"].pop("is_trajectory_collection", None)
+    config.env["nemo_gym"].pop("is_trajectory_collection", None)
 
     print("\nSetting up data...")
     train_dataset, val_dataset = setup_response_data(
-        tokenizer, config["data"], env_configs=None
+        tokenizer, config.data, env_configs=None
     )
     rollout_dataset = val_dataset if val_dataset is not None else train_dataset
     rollout_batch = _build_one_batch(rollout_dataset)
@@ -130,7 +131,7 @@ def main() -> None:
     pprint.pprint(config)
 
     init_ray()
-    logger = Logger(config["logger"])
+    logger = Logger(config.logger)
     logger.log_hyperparams(config)
     dynamo_prometheus_monitor = maybe_start_dynamo_prometheus_monitor(config, logger)
 
@@ -143,7 +144,7 @@ def main() -> None:
         nemo_gym_config = NemoGymConfig(
             model_name=generation_config["model_name"],
             base_urls=policy_generation.dp_openai_server_base_urls,
-            initial_global_config_dict=config["env"]["nemo_gym"],
+            initial_global_config_dict=config.env["nemo_gym"],
         )
         nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)
         ray.get(nemo_gym.health_check.remote())
