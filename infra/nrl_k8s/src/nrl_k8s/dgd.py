@@ -464,6 +464,15 @@ def _frontend_http_ready(name: str, namespace: str) -> bool:
     except ApiException as e:
         if e.status == 404:
             return True
+        if e.status == 403:
+            # Some clusters allow DGD/pod inspection but deny the API-server
+            # `services/proxy` verb (e.g. AWS SSO-scoped roles on EKS). In
+            # that RBAC shape we cannot prove frontend HTTP readiness from
+            # outside the cluster; rely on the DGD `state=successful` and
+            # pod-readiness gates already passed by the caller, and treat
+            # this gate as ready. Users debugging can still curl the
+            # ClusterIP from inside the cluster.
+            return True
         return False
     except Exception:
         return False

@@ -92,7 +92,7 @@ def bring_up_cluster(
     *,
     log: callable,
     wait_ready: bool = True,
-    ready_timeout_s: int = 900,
+    ready_timeout_s: int = 1800,
 ) -> str:
     """Apply the RayCluster for ``role`` and wait for it to be ready."""
     cluster = _require_cluster(loaded.infra, role)
@@ -119,7 +119,7 @@ def ensure_cluster(
     log: callable,
     recreate: bool = False,
     wait_ready: bool = True,
-    ready_timeout_s: int = 900,
+    ready_timeout_s: int = 1800,
 ) -> str:
     """Idempotent cluster up: reuse when live matches rendered, warn on drift.
 
