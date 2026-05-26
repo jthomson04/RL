@@ -12,7 +12,9 @@
 # GB300 total). Expected wall-clock ~56 min for 281 samples at
 # concurrency=16, matching jthomson04's 2026-05-19 production rollout.
 #
-# The model's official native context length is 262144 tokens. Keep
+# The model's official native context length is 262144 tokens. We pin the
+# rollout-side to 192K = 196608 (slightly below native) to leave headroom
+# for KV cache + safer scheduling without changing the agent UX. Keep
 # policy.max_total_sequence_length aligned with the Dynamo/vLLM max-model-len.
 
 defaults: ../../nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
@@ -34,7 +36,7 @@ policy:
   train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  max_total_sequence_length: 262144
+  max_total_sequence_length: 196608
   precision: "bfloat16"
   make_sequence_length_divisible_by: 8
 

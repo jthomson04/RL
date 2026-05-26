@@ -26,13 +26,13 @@ _shared:
         name: ${user:}-secrets
         optional: true
   headEnv: &shared_head_env
-    - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf_home"}
     - {name: NCCL_DEBUG,                    value: WARN}
     - {name: PYTHONPATH,                    value: "/opt/nemo-rl:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM"}
     - {name: RAY_memory_monitor_refresh_ms, value: "0"}
     - {name: NRL_FORCE_REBUILD_VENVS,       value: "true"}
   workerEnv: &shared_worker_env
-    - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf_home"}
     - {name: NCCL_DEBUG,                    value: WARN}
     - {name: PYTHONPATH,                    value: "/opt/nemo-rl:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM"}
     - {name: RAY_memory_monitor_refresh_ms, value: "0"}
@@ -273,3 +273,25 @@ dynamo:
                   value: "false"
                 - name: HF_HOME
                   value: /mnt/rl-workspace/${user:}/hf_home
+        Frontend:
+          extraPodSpec:
+            mainContainer:
+              env:
+                # HF_HOME alone is not enough: Dynamo's `/tokenize` endpoint
+                # specifically refuses tokenizer refs that look "URL-backed"
+                # (i.e. `Qwen/...` parsed as `hf://Qwen/...`) — it requires
+                # a local filesystem path. `DYN_MODEL_PATH` is the env-var
+                # equivalent of dynamo.frontend's `--model-path` flag and
+                # points it at the on-PVC HF snapshot dir so the tokenizer
+                # loads locally instead of trying to fetch from HF Hub
+                # (which fails on customer-cpu nodes lacking HF egress).
+                # The snapshot hash is the upstream HF Hub commit hash,
+                # stable across every user that runs
+                # `huggingface-cli download Qwen/Qwen3-30B-A3B-Instruct-2507`,
+                # so the literal hash is the right reproducible knob here.
+                # Paired with the rl-workspace volume + mount in the Frontend
+                # service in ./dgd.gb300.yaml.
+                - name: HF_HOME
+                  value: /mnt/rl-workspace/${user:}/hf_home
+                - name: DYN_MODEL_PATH
+                  value: /mnt/rl-workspace/${user:}/hf_home/hub/models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe

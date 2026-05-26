@@ -42,9 +42,22 @@ spec:
         nodeSelector:
           nodeGroup: customer-cpu
           kubernetes.io/arch: arm64
+        # Frontend needs the same rl-workspace mount as the Worker so its
+        # `/tokenize` endpoint can load the tokenizer from the on-PVC HF
+        # cache instead of trying to fetch the URL-backed `hf://Qwen/...`
+        # (which fails with 500 on customer-cpu nodes that lack outbound
+        # HF Hub access). The matching HF_HOME env is injected by the
+        # infra YAML's dynamo.serving.overrides (see infra.gb300.yaml).
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
         mainContainer:
           image: jwillthomson/dynamo-arm-rl-tokenize-endpoint-07c4f28:latest
           workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
           command:
             - python3
             - -m
@@ -93,7 +106,7 @@ spec:
             - --gpu-memory-utilization
             - "0.90"
             - --max-model-len
-            - "262144"
+            - "196608"
             - --trust-remote-code
             - --enforce-eager
             # Dynamo-specific tool-call parser; vLLM's --tool-call-parser is
