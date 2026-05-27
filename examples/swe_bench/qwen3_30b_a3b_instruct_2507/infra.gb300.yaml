@@ -273,6 +273,21 @@ dynamo:
                   value: "false"
                 - name: HF_HOME
                   value: /mnt/rl-workspace/${user:}/hf_home
+                # Worker reads $DYN_MODEL_PATH via the bash -c wrapper in
+                # ./dgd.gb300.yaml and passes it as `--model <path>` instead
+                # of `--model Qwen/Qwen3-30B-A3B-Instruct-2507`. With a real
+                # filesystem path, the worker skips the move_to_url rewrite
+                # in upstream lib/llm/src/local_model.rs:527-542 and publishes
+                # a ModelDeploymentCard whose tokenizer field carries a local
+                # path. This is the root-cause fix for the "/tokenize 500
+                # Tokenizer is URL-backed" failure (every worker's card stays
+                # local instead of only the first worker's getting fixed up
+                # on the Frontend by download_config).
+                #
+                # Snapshot hash is the upstream HF Hub commit hash, identical
+                # across users — same constant as Frontend's DYN_MODEL_PATH.
+                - name: DYN_MODEL_PATH
+                  value: /mnt/rl-workspace/${user:}/hf_home/hub/models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe
         Frontend:
           extraPodSpec:
             mainContainer:

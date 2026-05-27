@@ -93,30 +93,33 @@ spec:
           volumeMounts:
             - mountPath: /mnt/rl-workspace
               name: rl-workspace
-          command:
-            - python3
-            - -m
-            - dynamo.vllm
+          # Pass --model as a local PVC path, not the HF id "Qwen/...".
+          # Worker side (upstream lib/llm/src/local_model.rs:527-542) checks
+          # `PathBuf::from(source_path).exists()`; when source_path is an HF
+          # id it returns false and the worker rewrites the ModelDeploymentCard's
+          # tokenizer field to `hf://Qwen/.../tokenizer.json`. Only the first
+          # worker's card then gets `download_config` on the Frontend side
+          # (lib/llm/src/discovery/watcher.rs:689-694); the other 3 keep the
+          # URL-backed card, and JT's `/tokenize` handler 500s with "URL-backed"
+          # whenever it picks one of them.
+          #
+          # The bash -c wrapper expands $DYN_MODEL_PATH (injected via
+          # infra.gb300.yaml's dynamo.serving.overrides) into the CLI flag at
+          # container start, mirroring the pattern the Frontend already uses.
+          # `--served-model-name` stays as the canonical HF id so callers
+          # still address the model by `Qwen/Qwen3-30B-A3B-Instruct-2507`.
+          command: ["bash", "-c"]
           args:
-            - --model
-            - Qwen/Qwen3-30B-A3B-Instruct-2507
-            # Served name is the canonical HF id so nemo-gym sends the same
-            # `model` field regardless of whether the snapshot is on PVC or
-            # gets fetched from HF.
-            - --served-model-name
-            - Qwen/Qwen3-30B-A3B-Instruct-2507
-            - --tensor-parallel-size
-            - "2"
-            - --gpu-memory-utilization
-            - "0.90"
-            - --max-model-len
-            - "196608"
-            - --trust-remote-code
-            - --enforce-eager
-            # Dynamo-specific tool-call parser; vLLM's --tool-call-parser is
-            # server-only, but in Dynamo the worker handles tool parsing.
-            - --dyn-tool-call-parser
-            - hermes
+            - >
+              exec python3 -m dynamo.vllm
+              --model "$DYN_MODEL_PATH"
+              --served-model-name Qwen/Qwen3-30B-A3B-Instruct-2507
+              --tensor-parallel-size 2
+              --gpu-memory-utilization 0.90
+              --max-model-len 196608
+              --trust-remote-code
+              --enforce-eager
+              --dyn-tool-call-parser hermes
           env:
             - name: DYN_HEALTH_CHECK_ENABLED
               value: "false"
