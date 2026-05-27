@@ -58,15 +58,19 @@ spec:
           volumeMounts:
             - mountPath: /mnt/rl-workspace
               name: rl-workspace
-          command:
-            - python3
-            - -m
-            - dynamo.frontend
+          # Wrap in `bash -c` so $DYN_MODEL_PATH (injected via infra.gb300.yaml's
+          # dynamo.serving.overrides) gets expanded into an explicit
+          # `--model-path` CLI flag at container start. The plain env-var form
+          # alone has regressed at least once when the upstream
+          # jwillthomson/dynamo-arm-rl-tokenize-endpoint:latest tag was rebuilt,
+          # so passing the path as a flag forces the tokenizer init code path
+          # we want regardless of any future env handling drift in the image.
+          command: ["bash", "-c"]
           args:
-            # Non-empty args required to override the upstream image's CMD,
-            # otherwise the frontend re-parses '-m dynamo.frontend' as user
-            # input and crash-loops. Same workaround as qwen3_4b_thinking.
-            - --router-reset-states
+            - >
+              exec python3 -m dynamo.frontend
+              --model-path "$DYN_MODEL_PATH"
+              --router-reset-states
     VllmDecodeWorker:
       componentType: worker
       # 4 worker pods x 2 GPUs each = 8 GB300 total. TP=2 means each worker

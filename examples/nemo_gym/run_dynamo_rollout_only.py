@@ -100,26 +100,34 @@ def _dump_swe_archive_layout(
     exp_dir = Path(config.logger["log_dir"])
     model_name = config.policy["model_name"]
 
-    # trajectories/ — real dir holding a `results` symlink so the resulting
-    # `trajectories/results/verified/<model>/<instance>/*.traj.json` path
-    # matches the standalone mini_swe_agent eval archive shape exactly.
-    # Symlink target is absolute so the bundle survives moving exp_NNN/.
+    # trajectories/ — mini_swe_agent's app.py writes every trajectory under
+    # `${Path.cwd()}/results/verified/<model>/<instance>/` (hardcoded; no
+    # config knob). To keep each run's results isolated, the launcher
+    # (`run_test.sh`) quarantines any preexisting `results/` aside before
+    # starting, and here we **move** the just-written tree into exp_NNN/ so
+    # this run's data lives entirely under exp_NNN. An empty stub is
+    # recreated in place so the next run can write into it without racing.
     native_results = Path(
         "3rdparty/Gym-workspace/Gym/responses_api_agents/mini_swe_agent/results"
     ).resolve()
     trajectories_dir = exp_dir / "trajectories"
-    if native_results.exists():
+    if native_results.exists() and any(native_results.iterdir()):
         trajectories_dir.mkdir(exist_ok=True)
-        results_link = trajectories_dir / "results"
-        if results_link.exists() or results_link.is_symlink():
-            results_link.unlink()
+        results_dst = trajectories_dir / "results"
+        if results_dst.exists() or results_dst.is_symlink():
+            # Stale leftover (e.g. previous partial run we're re-archiving).
+            if results_dst.is_symlink() or results_dst.is_file():
+                results_dst.unlink()
+            else:
+                shutil.rmtree(results_dst)
         try:
-            results_link.symlink_to(native_results, target_is_directory=True)
-            print(f"[archive] linked {results_link} -> {native_results}")
+            shutil.move(str(native_results), str(results_dst))
+            native_results.mkdir(parents=True, exist_ok=True)
+            print(f"[archive] moved {native_results} -> {results_dst}")
         except OSError as exc:
-            print(f"[archive] failed to symlink {results_link}: {exc}")
+            print(f"[archive] failed to move {native_results}: {exc}")
     else:
-        print(f"[archive] {native_results} not found; skipping trajectories link")
+        print(f"[archive] {native_results} not found or empty; skipping trajectories move")
 
     # manifests/ — recipe.yaml + sibling infra/DGD YAMLs from the experiment folder.
     # Done BEFORE write_summary so the analysis CLI can autodetect the model
