@@ -1114,6 +1114,111 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         )
 
     @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_mx")
+    def stream_weights_via_mx(
+        self,
+        *,
+        version: int,
+        mx_config: Any,
+    ) -> None:
+        """Publish HF-format weights to ModelExpress for NIXL RDMA refit (v2).
+
+        Unlike the DTensor path — which publishes each rank's local shard
+        via ``tensor.to_local()`` and lets receivers reassemble using
+        DTensor placement metadata — Megatron-Core stores weights in its
+        own TP/PP/EP-sharded layout with no in-band placement info.
+        We therefore iterate ``megatron_bridge.export_hf_weights`` (the
+        same iterator the IPC/collective paths use), which runs internal
+        TP/EP/PP gathers and yields full HF-named tensors on each rank.
+
+        Each trainer rank publishes the full set of HF tensors; MX load-
+        balances receivers across the equivalent publishers. Because no
+        axis-sharding is advertised, ``MxConfig.same_rank_only`` must be
+        ``False`` so receivers can pull from any rank.
+
+        MoE expert filtering and FP8 KV-cache scales are not yet
+        supported on this path — matching the DTensor MX path's
+        starting stance. Follow-ups can drive expert metadata from
+        ``refit_conversion_tasks`` (each task carries authoritative
+        ``mapping.is_expert`` / ``mapping.ep_size``).
+        """
+        if getattr(self, "_kv_scales_for_mx", None):
+            raise NotImplementedError(
+                "FP8 kvcache scales are not yet supported on the MX path"
+            )
+
+        assert self.refit_conversion_tasks is not None, (
+            "prepare_refit_info() must be called before stream_weights_via_mx()"
+        )
+
+        # ---- Lazy-init the MX publisher (once per worker lifetime) ----
+        if not hasattr(self, "_mx_publisher") or self._mx_publisher is None:
+            from nemo_rl.distributed.mx_helpers import build_v2_publisher
+
+            world_size = (
+                torch.distributed.get_world_size()
+                if torch.distributed.is_initialized()
+                else 1
+            )
+            # export_hf_weights yields gathered, replica-style HF tensors
+            # from every rank, so the TrainerWorldLayout's TP/PP/EP axes
+            # are all 1 — there is no axis-sharding to communicate to
+            # receivers. fsdp_world_size carries the rank count for
+            # replication-aware routing.
+            self._mx_publisher = build_v2_publisher(
+                rank=self.rank,
+                device_id=torch.cuda.current_device(),
+                fsdp_world_size=world_size,
+                tp_world_size=1,
+                pp_world_size=1,
+                ep_world_size=1,
+                mx_config=mx_config,
+            )
+            self._mx_publisher.initialize(
+                model_name=self.cfg["model_name"],
+                dtype=str(self.dtype).removeprefix("torch."),
+            )
+
+        # ---- Persistent publisher buffers: stable address, mutating values ----
+        # training_publisher.publish_weights() registers tensors with NIXL
+        # only on the FIRST call ("parameter tensor addresses stay constant
+        # across optimizer steps. Subsequent calls reuse the cached metadata
+        # and descriptors."). The DTensor path satisfies this because it
+        # publishes the live DTensor local shards (stable addresses, mutated
+        # in-place by training). Our Megatron path can't publish live params
+        # directly because export_hf_weights gathers TP-split tensors into
+        # FRESH allocations every call.
+        #
+        # Solution: allocate persistent HF-shaped publisher buffers once and
+        # copy_ the gathered HF tensors into them each refit. The buffer
+        # addresses stay stable so NIXL's cached descriptors keep working;
+        # the contents change so the receiver pulls fresh bytes every step.
+        if not hasattr(self, "_mx_publish_buffers"):
+            self._mx_publish_buffers = {}
+        # Clear only the v2 descriptor list (which add_tensor appends to).
+        # _registered_tensors is a dict so re-adding overwrites cleanly.
+        # The underlying publish_weights registers with NIXL only on its
+        # first call and reuses cached metadata thereafter, which is exactly
+        # what we want now that buffer addresses are stable.
+        self._mx_publisher._registry.clear()
+        for name, tensor in self._iter_params_with_optional_kv_scales():
+            if tensor.is_floating_point() and tensor.dtype != self.dtype:
+                tensor = tensor.to(self.dtype, non_blocking=True)
+            tensor = tensor.contiguous()
+            buf = self._mx_publish_buffers.get(name)
+            if buf is None or buf.shape != tensor.shape or buf.dtype != tensor.dtype:
+                buf = torch.empty(
+                    tensor.shape, dtype=tensor.dtype, device=tensor.device
+                )
+                self._mx_publish_buffers[name] = buf
+            buf.copy_(tensor)
+            self._mx_publisher.add_tensor(name=name, tensor=buf)
+
+        # ---- Publish + mark ready ----
+        self._mx_publisher.publish(version=int(version))
+        self._mx_publisher.mark_ready()
+
+    @torch.no_grad()
     def broadcast_weights_for_collective(
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> None:

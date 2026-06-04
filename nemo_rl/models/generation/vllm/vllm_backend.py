@@ -323,33 +323,49 @@ class VllmInternalWorkerExtension:
                     mx_config=mx_config,
                 )
 
-                # Build receive buffer dict from current model parameters.
-                # The trainer publishes local DTensor shards; on the inference
-                # side we want vLLM's already-allocated parameters as the
-                # destination buffers (no extra copy). vLLM stores them on
-                # ``self.model_runner.model``; iterate named_parameters to get
-                # them.
-                receive_buffers = {
-                    name: p.data
-                    for name, p in self.model_runner.model.named_parameters()
-                    if p.is_cuda
-                }
+                # Allocate receive buffers keyed by the trainer's HF names
+                # (state_dict_info, same source the IPC ZMQ path uses). The
+                # bytes land in these HF-shaped buffers; vLLM's load_weights
+                # later applies HF→fused remapping (q_proj+k_proj+v_proj →
+                # qkv_proj) when we hand it (hf_name, buf) tuples.
+                receive_buffers = {}
+                for hf_name, info in self.state_dict_info.items():
+                    shape, dtype = info
+                    if isinstance(shape, list):
+                        shape = torch.Size(shape)
+                    receive_buffers[hf_name] = torch.zeros(
+                        shape, dtype=dtype, device=self.device
+                    )
                 self._mx_receiver.initialize(model_tensors=receive_buffers)
                 self._mx_recv_buffers = receive_buffers
 
             # ---- Discover, pick, and pull ----
-            candidates = self._mx_receiver.discover_v2_sources(
-                model_name=self.model_config.model
+            # discover_v2_sources() is single-shot; poll for up to
+            # mx_config.timeout_seconds so the publisher has time to register
+            # its source on the MX server.
+            import time
+            _model_name = (
+                self.model_config.model
                 if hasattr(self.model_config, "model")
-                else getattr(self.model_runner.vllm_config.model_config, "model", "unknown"),
-                min_version=int(version),
-                same_rank_only=mx_config.same_rank_only,
-                include_replicas=mx_config.tree_scale_out,
+                else getattr(self.model_runner.vllm_config.model_config, "model", "unknown")
             )
+            _deadline = time.perf_counter() + float(mx_config.timeout_seconds)
+            candidates = []
+            while True:
+                candidates = self._mx_receiver.discover_v2_sources(
+                    model_name=_model_name,
+                    min_version=int(version),
+                    same_rank_only=mx_config.same_rank_only,
+                    include_replicas=mx_config.tree_scale_out,
+                )
+                if candidates or time.perf_counter() >= _deadline:
+                    break
+                time.sleep(0.5)
             if not candidates:
                 print(
                     f"[mx] no v2 source available for version>={version} on rank "
-                    f"{self._mx_receiver.worker_rank}"
+                    f"{self._mx_receiver.worker_rank} after "
+                    f"{mx_config.timeout_seconds}s"
                 )
                 return False
 
@@ -390,6 +406,16 @@ class VllmInternalWorkerExtension:
 
             self._load_weights(weights)
             torch.cuda.current_stream().synchronize()
+
+            # Match the IPC ZMQ path: re-run vLLM's post-load processing so
+            # quantization scales, fused-weight transposes, etc. are applied
+            # after every refit, not just at initial model load.
+            from vllm.model_executor.model_loader.utils import (
+                process_weights_after_loading,
+            )
+            process_weights_after_loading(
+                self.model_runner.model, self.model_config, self.device
+            )
 
             # FP8 KV cache hook reuse
             self._maybe_process_fp8_kv_cache()
