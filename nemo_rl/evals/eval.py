@@ -37,7 +37,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.math_environment import MathEnvConfig
 from nemo_rl.environments.vlm_environment import VLMEnvConfig
-from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
+from nemo_rl.models.generation.dynamo import DynamoCfg, DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationDatumSpec,
@@ -45,6 +45,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.config import VllmSpecificArgs
 from nemo_rl.models.policy import TokenizerConfig
 
 # ===============================================================================
@@ -64,9 +65,9 @@ class EvalGenerationConfig(GenerationConfig):
     """Generation config fields consumed by the eval entrypoint."""
 
     num_prompts_per_step: int
-    vllm_cfg: NotRequired[dict[str, Any]]
+    vllm_cfg: NotRequired[VllmSpecificArgs]
     vllm_kwargs: NotRequired[dict[str, Any]]
-    dynamo_cfg: NotRequired[dict[str, Any]]
+    dynamo_cfg: NotRequired[DynamoCfg]
 
 
 # TODO: this should updated, but is left to avoid breaking changes
