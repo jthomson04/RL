@@ -17,7 +17,7 @@ import json
 import os
 from collections import Counter
 from itertools import combinations
-from typing import NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict, cast
 
 import ray
 import torch
@@ -29,13 +29,22 @@ from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import EvalDataConfigType
 from nemo_rl.data.collate_fn import eval_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.llm_message_utils import get_keys_from_message_log
+from nemo_rl.data.llm_message_utils import (
+    batched_message_log_to_flat_message,
+    get_keys_from_message_log,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.math_environment import MathEnvConfig
 from nemo_rl.environments.vlm_environment import VLMEnvConfig
-from nemo_rl.models.generation.interfaces import GenerationConfig
-from nemo_rl.models.generation.vllm import VllmGeneration
+from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
+from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
+    GenerationDatumSpec,
+    GenerationInterface,
+    GenerationOutputSpec,
+)
+from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import TokenizerConfig
 
 # ===============================================================================
@@ -51,6 +60,15 @@ class EvalConfig(TypedDict):
     save_path: str | None
 
 
+class EvalGenerationConfig(GenerationConfig):
+    """Generation config fields consumed by the eval entrypoint."""
+
+    num_prompts_per_step: int
+    vllm_cfg: NotRequired[dict[str, Any]]
+    vllm_kwargs: NotRequired[dict[str, Any]]
+    dynamo_cfg: NotRequired[dict[str, Any]]
+
+
 # TODO: this should updated, but is left to avoid breaking changes
 class _PassThroughEnvConfig(TypedDict):
     math: NotRequired[MathEnvConfig]
@@ -59,7 +77,7 @@ class _PassThroughEnvConfig(TypedDict):
 
 class MasterConfig(BaseModel, extra="allow"):
     eval: EvalConfig
-    generation: GenerationConfig  # Fixed: was 'generate'
+    generation: EvalGenerationConfig  # Fixed: was 'generate'
     tokenizer: TokenizerConfig  # Added missing tokenizer key
     data: EvalDataConfigType
     env: _PassThroughEnvConfig
@@ -76,7 +94,7 @@ def setup(
     tokenizer: AutoTokenizer,
     dataset: AllTaskProcessedDataset,
 ) -> tuple[
-    VllmGeneration,
+    GenerationInterface,
     DataLoader,
     MasterConfig,
 ]:
@@ -132,31 +150,12 @@ def setup(
     print(f"  ✓ Evaluation dataset loaded with {len(dataset)} samples")
 
     # ==========================
-    #          Cluster
-    # ==========================
-    print("\n▶ Setting up compute cluster...")
-    cluster = RayVirtualCluster(
-        name="eval_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-        * cluster_config["num_nodes"],
-        use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
-        max_colocated_worker_groups=1,
-    )
-    print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
-
-    # ==========================
     #           Model
     # ==========================
     print("\n▶ Setting up model...")
-    # check backend
-    backend = generation_config["backend"]
-    assert backend == "vllm", "Only vLLM backend is supported for evaluation"
-
-    # initialize vllm generation
-    vllm_generation = VllmGeneration(cluster=cluster, config=generation_config)
-    print(
-        f"  ✓ Using vLLM backend for generation with {generation_config['model_name']}"
+    generation = _setup_generation(
+        generation_config=generation_config,
+        cluster_config=cluster_config,
     )
 
     print("\n" + "=" * 60)
@@ -164,9 +163,51 @@ def setup(
     print("=" * 60 + "\n")
 
     return (
-        vllm_generation,
+        generation,
         dataloader,
         master_config,
+    )
+
+
+def _setup_generation(
+    generation_config: EvalGenerationConfig,
+    cluster_config: ClusterConfig,
+) -> GenerationInterface:
+    """Set up the configured eval generation backend."""
+    backend = generation_config["backend"]
+    if backend == "vllm":
+        print("\n▶ Setting up compute cluster...")
+        cluster = RayVirtualCluster(
+            name="eval_cluster",
+            bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
+            * cluster_config["num_nodes"],
+            use_gpus=True,
+            num_gpus_per_node=cluster_config["gpus_per_node"],
+            max_colocated_worker_groups=1,
+        )
+        print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
+        generation = VllmGeneration(
+            cluster=cluster,
+            config=cast(VllmConfig, generation_config),
+        )
+        print(
+            f"  ✓ Using vLLM backend for generation with "
+            f"{generation_config['model_name']}"
+        )
+        return generation
+
+    if backend == "dynamo":
+        generation = DynamoGeneration(
+            cluster=None,
+            config=cast(DynamoConfig, generation_config),
+        )
+        frontend_url = generation.dp_openai_server_base_urls[0]
+        print(f"  ✓ Using Dynamo backend (frontend: {frontend_url})")
+        return generation
+
+    raise ValueError(
+        f"Unsupported evaluation generation backend: {backend}. "
+        "Supported backends are: vllm, dynamo."
     )
 
 
@@ -277,34 +318,38 @@ def eval_cons_k(
     return cons_k_score
 
 
-def run_env_eval(vllm_generation, dataloader, env, master_config):
+def run_env_eval(generation, dataloader, env, master_config, tokenizer):
     """Main entry point for running evaluation using environment.
 
     Generates model responses and evaluates them by env.
 
     Args:
-        vllm_generation: Model for generating responses.
+        generation: Model for generating responses.
         dataloader: Data loader with evaluation samples.
         env: Environment that scores responses.
         master_config: Configuration settings.
+        tokenizer: Tokenizer used to decode generated token IDs.
     """
-    # Check if async engine is enabled and run appropriate version
-    if master_config.generation["vllm_cfg"]["async_engine"]:
-        asyncio.run(
-            _run_env_eval_impl(
-                vllm_generation, dataloader, env, master_config, use_async=True
-            )
+    use_async = _should_use_async_generation(generation, master_config.generation)
+    asyncio.run(
+        _run_env_eval_impl(
+            generation,
+            dataloader,
+            env,
+            master_config,
+            tokenizer,
+            use_async=use_async,
         )
-    else:
-        asyncio.run(
-            _run_env_eval_impl(
-                vllm_generation, dataloader, env, master_config, use_async=False
-            )
-        )
+    )
 
 
 async def _run_env_eval_impl(
-    vllm_generation, dataloader, env, master_config, use_async=False
+    generation,
+    dataloader,
+    env,
+    master_config,
+    tokenizer,
+    use_async=False,
 ):
     """Unified implementation for both sync and async evaluation."""
     # Extract for easier access
@@ -358,9 +403,22 @@ async def _run_env_eval_impl(
                 prompts.append(content)
                 prompts_for_display.append(content)
 
-        # generate by vllm
-        inputs = BatchedDataDict({"prompts": prompts})
-        outputs = await _generate_texts(vllm_generation, inputs, use_async)
+        generation_inputs, input_lengths = _build_generation_inputs(
+            batch=batch,
+            tokenizer=tokenizer,
+            backend=generation_config["backend"],
+        )
+        generation_outputs = await _generate_outputs(
+            generation=generation,
+            inputs=generation_inputs,
+            use_async=use_async,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+        outputs = _decode_generated_texts(
+            generation_outputs=generation_outputs,
+            input_lengths=input_lengths,
+            tokenizer=tokenizer,
+        )
 
         # append to message_log
         for idx, output in enumerate(outputs):
@@ -414,7 +472,7 @@ async def _run_env_eval_impl(
 
     # Cleanup before printing results
     ray.get(env.shutdown.remote())
-    vllm_generation.shutdown()
+    generation.shutdown()
 
     # Save evaluation data to JSON file if save_path is specified
     save_path = eval_config.get("save_path")
@@ -433,25 +491,110 @@ async def _run_env_eval_impl(
     )
 
 
-async def _generate_texts(vllm_generation, inputs, use_async):
-    """Generate texts using either sync or async method."""
+def _should_use_async_generation(
+    generation: GenerationInterface,
+    generation_config: EvalGenerationConfig,
+) -> bool:
+    """Return whether eval should fan out per-sample async generation."""
+    backend = generation_config["backend"]
+    if backend == "dynamo":
+        return True
+    if backend == "vllm":
+        vllm_cfg = generation_config["vllm_cfg"]
+        return bool(vllm_cfg["async_engine"])
+    return hasattr(generation, "generate_async")
+
+
+def _build_generation_inputs(
+    *,
+    batch: BatchedDataDict[Any],
+    tokenizer: AutoTokenizer,
+    backend: str,
+) -> tuple[BatchedDataDict[GenerationDatumSpec], torch.Tensor]:
+    """Build GenerationInterface inputs from an eval batch."""
+    if backend == "dynamo" and _has_multimodal_content(batch):
+        raise ValueError(
+            "Dynamo evaluation supports text-only datasets. Use backend=vllm "
+            "for multimodal eval datasets such as MMAU."
+        )
+
+    flat_messages, input_lengths = batched_message_log_to_flat_message(
+        batch["message_log"],
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+    )
+    inputs = BatchedDataDict[GenerationDatumSpec](
+        {
+            "input_ids": flat_messages["token_ids"],
+            "input_lengths": input_lengths,
+        }
+    )
+
+    if "stop_strings" in batch:
+        inputs["stop_strings"] = batch["stop_strings"]
+    else:
+        inputs["stop_strings"] = [None] * len(input_lengths)
+
+    if backend == "vllm" and "vllm_content" in batch:
+        inputs["vllm_content"] = batch["vllm_content"]
+        if "vllm_images" in batch:
+            inputs["vllm_images"] = batch["vllm_images"]
+        if "vllm_audios" in batch:
+            inputs["vllm_audios"] = batch["vllm_audios"]
+
+    return inputs, input_lengths
+
+
+def _has_multimodal_content(batch: BatchedDataDict[Any]) -> bool:
+    """Return True if the batch contains vLLM multimodal prompt content."""
+    if "vllm_content" not in batch:
+        return False
+    return any(content is not None for content in batch["vllm_content"])
+
+
+async def _generate_outputs(
+    *,
+    generation: GenerationInterface,
+    inputs: BatchedDataDict[GenerationDatumSpec],
+    use_async: bool,
+    pad_token_id: int,
+) -> BatchedDataDict[GenerationOutputSpec]:
+    """Generate token outputs using either sync or async backend methods."""
     if use_async:
-        # generate_text_async accepts one sample per call; fan out and gather.
         async def _generate_single_sample(i):
             single = inputs.slice(i, i + 1)
-            async for _, result in vllm_generation.generate_text_async(single):
-                return (i, result["texts"][0])
+            async for _, result in generation.generate_async(single):
+                return (i, result)
             raise RuntimeError(f"No output produced for sample {i}")
 
         results = await asyncio.gather(
             *(_generate_single_sample(i) for i in range(inputs.size))
         )
-        # Sort by index to maintain order
         results.sort(key=lambda x: x[0])
-        return [text for _, text in results]
-    else:
-        # Use sync generation
-        return vllm_generation.generate_text(inputs)["texts"]
+        return BatchedDataDict.from_batches(
+            [result for _, result in results],
+            pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
+        )
+
+    return generation.generate(inputs, greedy=False)
+
+
+def _decode_generated_texts(
+    *,
+    generation_outputs: BatchedDataDict[GenerationOutputSpec],
+    input_lengths: torch.Tensor,
+    tokenizer: AutoTokenizer,
+) -> list[str]:
+    """Decode only generated suffix tokens from generation outputs."""
+    output_ids = generation_outputs["output_ids"]
+    unpadded_sequence_lengths = generation_outputs["unpadded_sequence_lengths"]
+
+    generated_ids = []
+    for i in range(len(input_lengths)):
+        input_len = input_lengths[i].item()
+        total_length = unpadded_sequence_lengths[i].item()
+        generated_ids.append(output_ids[i, input_len:total_length])
+
+    return tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
 
 def _save_evaluation_data_to_json(evaluation_data, master_config, save_path):
@@ -525,7 +668,7 @@ def _print_results(
     """Print evaluation results."""
     dataset_name = os.path.basename(master_config.data["dataset_name"])
     model_name = os.path.basename(generation_config["model_name"])
-    max_new_tokens = generation_config["vllm_cfg"]["max_model_len"]
+    max_new_tokens = generation_config["max_new_tokens"]
     seed = master_config.eval["seed"]
     temperature = generation_config["temperature"]
     top_p = generation_config["top_p"]

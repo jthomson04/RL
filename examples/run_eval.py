@@ -86,9 +86,8 @@ def main():
     print(f"Loaded configuration from: {args.config}")
 
     if overrides:
-        override_conf = OmegaConf.from_cli()
-        print(f"Overrides: {override_conf}")
-        config = OmegaConf.merge(config, override_conf)
+        print(f"Overrides: {overrides}")
+        config = OmegaConf.merge(config, overrides)
 
     config = OmegaConf.to_container(config, resolve=True)
     config = MasterConfig(**config)
@@ -117,17 +116,18 @@ def main():
 
     # Setup
     (
-        vllm_generation,
+        generation,
         dataloader,
         master_config,
     ) = setup(config, tokenizer, dataset)
 
     # Run evaluation
     run_env_eval(
-        vllm_generation,
+        generation,
         dataloader,
         env,
         master_config,
+        tokenizer,
     )
 
 

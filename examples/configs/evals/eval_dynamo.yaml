@@ -1,0 +1,12 @@
+# Evaluation Configuration using an external DynamoGraphDeployment.
+defaults: "eval.yaml"
+
+generation:
+  backend: "dynamo"
+  dynamo_cfg:
+    # Set exactly one of these at runtime:
+    #   generation.dynamo_cfg.dgd_name=<dgd-name>
+    #   generation.dynamo_cfg.frontend_url=http://<host>:8000/v1
+    request_timeout_s: 300.0
+  colocated:
+    enabled: false
