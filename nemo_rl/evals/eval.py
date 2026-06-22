@@ -17,7 +17,7 @@ import json
 import os
 from collections import Counter
 from itertools import combinations
-from typing import Any, NotRequired, TypedDict, cast
+from typing import Any, Literal, NotRequired, TypedDict, cast
 
 import ray
 import torch
@@ -45,7 +45,6 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
-from nemo_rl.models.generation.vllm.config import VllmSpecificArgs
 from nemo_rl.models.policy import TokenizerConfig
 
 # ===============================================================================
@@ -61,11 +60,30 @@ class EvalConfig(TypedDict):
     save_path: str | None
 
 
+class EvalVllmConfig(TypedDict):
+    """vLLM config fields accepted by eval YAML before runtime enrichment."""
+
+    async_engine: bool
+    precision: str
+    tensor_parallel_size: int
+    pipeline_parallel_size: int
+    expert_parallel_size: int
+    gpu_memory_utilization: float
+    max_model_len: int
+    enforce_eager: NotRequired[bool]
+    load_format: NotRequired[str]
+    skip_tokenizer_init: NotRequired[bool]
+    kv_cache_dtype: NotRequired[Literal["auto", "fp8", "fp8_e4m3"]]
+    expose_http_server: NotRequired[bool]
+    http_server_serving_chat_kwargs: NotRequired[dict[str, Any]]
+    tool_parser_plugin: NotRequired[str]
+
+
 class EvalGenerationConfig(GenerationConfig):
     """Generation config fields consumed by the eval entrypoint."""
 
     num_prompts_per_step: int
-    vllm_cfg: NotRequired[VllmSpecificArgs]
+    vllm_cfg: NotRequired[EvalVllmConfig]
     vllm_kwargs: NotRequired[dict[str, Any]]
     dynamo_cfg: NotRequired[DynamoCfg]
 
@@ -331,7 +349,10 @@ def run_env_eval(generation, dataloader, env, master_config, tokenizer):
         master_config: Configuration settings.
         tokenizer: Tokenizer used to decode generated token IDs.
     """
-    use_async = _should_use_async_generation(generation, master_config.generation)
+    use_async_vllm = (
+        master_config.generation["backend"] == "vllm"
+        and master_config.generation["vllm_cfg"]["async_engine"]
+    )
     asyncio.run(
         _run_env_eval_impl(
             generation,
@@ -339,7 +360,7 @@ def run_env_eval(generation, dataloader, env, master_config, tokenizer):
             env,
             master_config,
             tokenizer,
-            use_async=use_async,
+            use_async_vllm=use_async_vllm,
         )
     )
 
@@ -350,9 +371,9 @@ async def _run_env_eval_impl(
     env,
     master_config,
     tokenizer,
-    use_async=False,
+    use_async_vllm=False,
 ):
-    """Unified implementation for both sync and async evaluation."""
+    """Run the eval loop for the configured generation backend."""
     # Extract for easier access
     generation_config = master_config.generation
     eval_config = master_config.eval
@@ -404,22 +425,19 @@ async def _run_env_eval_impl(
                 prompts.append(content)
                 prompts_for_display.append(content)
 
-        generation_inputs, input_lengths = _build_generation_inputs(
-            batch=batch,
-            tokenizer=tokenizer,
-            backend=generation_config["backend"],
-        )
-        generation_outputs = await _generate_outputs(
-            generation=generation,
-            inputs=generation_inputs,
-            use_async=use_async,
-            pad_token_id=tokenizer.pad_token_id,
-        )
-        outputs = _decode_generated_texts(
-            generation_outputs=generation_outputs,
-            input_lengths=input_lengths,
-            tokenizer=tokenizer,
-        )
+        if generation_config["backend"] == "vllm":
+            outputs = await _generate_texts(
+                generation,
+                BatchedDataDict({"prompts": prompts}),
+                use_async_vllm,
+            )
+        else:
+            outputs = _generate_from_token_ids(
+                generation=generation,
+                batch=batch,
+                tokenizer=tokenizer,
+                backend=generation_config["backend"],
+            )
 
         # append to message_log
         for idx, output in enumerate(outputs):
@@ -492,18 +510,44 @@ async def _run_env_eval_impl(
     )
 
 
-def _should_use_async_generation(
+async def _generate_texts(generation, inputs, use_async):
+    """Generate text outputs using the existing vLLM eval path."""
+    if use_async:
+        # generate_text_async accepts one sample per call; fan out and gather.
+        async def _generate_single_sample(i):
+            single = inputs.slice(i, i + 1)
+            async for _, result in generation.generate_text_async(single):
+                return (i, result["texts"][0])
+            raise RuntimeError(f"No output produced for sample {i}")
+
+        results = await asyncio.gather(
+            *(_generate_single_sample(i) for i in range(inputs.size))
+        )
+        results.sort(key=lambda x: x[0])
+        return [text for _, text in results]
+
+    return generation.generate_text(inputs)["texts"]
+
+
+def _generate_from_token_ids(
+    *,
     generation: GenerationInterface,
-    generation_config: EvalGenerationConfig,
-) -> bool:
-    """Return whether eval should fan out per-sample async generation."""
-    backend = generation_config["backend"]
-    if backend == "dynamo":
-        return True
-    if backend == "vllm":
-        vllm_cfg = generation_config["vllm_cfg"]
-        return bool(vllm_cfg["async_engine"])
-    return hasattr(generation, "generate_async")
+    batch: BatchedDataDict[Any],
+    tokenizer: AutoTokenizer,
+    backend: str,
+) -> list[str]:
+    """Generate text with a backend that consumes token-ID prompts."""
+    generation_inputs, input_lengths = _build_generation_inputs(
+        batch=batch,
+        tokenizer=tokenizer,
+        backend=backend,
+    )
+    generation_outputs = generation.generate(generation_inputs, greedy=False)
+    return _decode_generated_texts(
+        generation_outputs=generation_outputs,
+        input_lengths=input_lengths,
+        tokenizer=tokenizer,
+    )
 
 
 def _build_generation_inputs(
@@ -513,10 +557,11 @@ def _build_generation_inputs(
     backend: str,
 ) -> tuple[BatchedDataDict[GenerationDatumSpec], torch.Tensor]:
     """Build GenerationInterface inputs from an eval batch."""
-    if backend == "dynamo" and _has_multimodal_content(batch):
+    if _has_multimodal_content(batch):
         raise ValueError(
-            "Dynamo evaluation supports text-only datasets. Use backend=vllm "
-            "for multimodal eval datasets such as MMAU."
+            f"{backend} evaluation supports text-only datasets through the "
+            "generic token-ID generation path. Use backend=vllm for multimodal "
+            "eval datasets such as MMAU."
         )
 
     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -535,13 +580,6 @@ def _build_generation_inputs(
     else:
         inputs["stop_strings"] = [None] * len(input_lengths)
 
-    if backend == "vllm" and "vllm_content" in batch:
-        inputs["vllm_content"] = batch["vllm_content"]
-        if "vllm_images" in batch:
-            inputs["vllm_images"] = batch["vllm_images"]
-        if "vllm_audios" in batch:
-            inputs["vllm_audios"] = batch["vllm_audios"]
-
     return inputs, input_lengths
 
 
@@ -550,33 +588,6 @@ def _has_multimodal_content(batch: BatchedDataDict[Any]) -> bool:
     if "vllm_content" not in batch:
         return False
     return any(content is not None for content in batch["vllm_content"])
-
-
-async def _generate_outputs(
-    *,
-    generation: GenerationInterface,
-    inputs: BatchedDataDict[GenerationDatumSpec],
-    use_async: bool,
-    pad_token_id: int,
-) -> BatchedDataDict[GenerationOutputSpec]:
-    """Generate token outputs using either sync or async backend methods."""
-    if use_async:
-        async def _generate_single_sample(i):
-            single = inputs.slice(i, i + 1)
-            async for _, result in generation.generate_async(single):
-                return (i, result)
-            raise RuntimeError(f"No output produced for sample {i}")
-
-        results = await asyncio.gather(
-            *(_generate_single_sample(i) for i in range(inputs.size))
-        )
-        results.sort(key=lambda x: x[0])
-        return BatchedDataDict.from_batches(
-            [result for _, result in results],
-            pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
-        )
-
-    return generation.generate(inputs, greedy=False)
 
 
 def _decode_generated_texts(

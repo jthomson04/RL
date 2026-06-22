@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-import asyncio
 import sys
 
 from omegaconf import OmegaConf
@@ -25,8 +24,7 @@ import nemo_rl.evals.eval as eval_mod
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.evals.eval import (
     _build_generation_inputs,
-    _decode_generated_texts,
-    _generate_outputs,
+    _generate_from_token_ids,
     _setup_generation,
     eval_cons_k,
     eval_pass_k,
@@ -153,7 +151,38 @@ def test_setup_generation_allocates_cluster_for_vllm(monkeypatch):
     assert generation_calls[0][1] is config
 
 
-def test_build_generation_inputs_flattens_message_log():
+def test_build_generation_inputs_rejects_dynamo_multimodal():
+    batch = BatchedDataDict(
+        {
+            "message_log": [
+                [{"role": "user", "content": "look", "token_ids": torch.tensor([1])}]
+            ],
+            "vllm_content": ["<audio> prompt"],
+        }
+    )
+
+    with pytest.raises(ValueError, match="text-only"):
+        _build_generation_inputs(
+            batch=batch,
+            tokenizer=_FakeTokenizer(),
+            backend="dynamo",
+        )
+
+
+def test_generate_from_token_ids_decodes_backend_output():
+    class FakeGeneration:
+        def generate(self, data, greedy=False):
+            assert greedy is False
+            assert data["input_ids"].tolist() == [[1, 2], [3, 0]]
+            return BatchedDataDict(
+                {
+                    "output_ids": torch.tensor([[1, 2, 7, 0], [3, 9, 0, 0]]),
+                    "generation_lengths": torch.tensor([1, 1]),
+                    "unpadded_sequence_lengths": torch.tensor([3, 2]),
+                    "logprobs": torch.zeros((2, 4)),
+                }
+            )
+
     batch = BatchedDataDict(
         {
             "message_log": [
@@ -175,88 +204,14 @@ def test_build_generation_inputs_flattens_message_log():
         }
     )
 
-    inputs, input_lengths = _build_generation_inputs(
+    outputs = _generate_from_token_ids(
+        generation=FakeGeneration(),
         batch=batch,
         tokenizer=_FakeTokenizer(),
         backend="dynamo",
     )
 
-    assert inputs["input_ids"].tolist() == [[1, 2], [3, 0]]
-    assert input_lengths.tolist() == [2, 1]
-    assert inputs["stop_strings"] == [None, None]
-
-
-def test_build_generation_inputs_rejects_dynamo_multimodal():
-    batch = BatchedDataDict(
-        {
-            "message_log": [
-                [{"role": "user", "content": "look", "token_ids": torch.tensor([1])}]
-            ],
-            "vllm_content": ["<audio> prompt"],
-        }
-    )
-
-    with pytest.raises(ValueError, match="text-only"):
-        _build_generation_inputs(
-            batch=batch,
-            tokenizer=_FakeTokenizer(),
-            backend="dynamo",
-        )
-
-
-def test_decode_generated_texts_uses_only_generated_suffix():
-    outputs = BatchedDataDict(
-        {
-            "output_ids": torch.tensor([[1, 2, 7, 8, 0], [3, 9, 0, 0, 0]]),
-            "generation_lengths": torch.tensor([2, 1]),
-            "unpadded_sequence_lengths": torch.tensor([4, 2]),
-            "logprobs": torch.zeros((2, 5)),
-        }
-    )
-
-    texts = _decode_generated_texts(
-        generation_outputs=outputs,
-        input_lengths=torch.tensor([2, 1]),
-        tokenizer=_FakeTokenizer(),
-    )
-
-    assert texts == ["7 8", "9"]
-
-
-def test_generate_outputs_async_preserves_input_order():
-    class FakeAsyncGeneration:
-        async def generate_async(self, data, greedy=False):
-            del greedy
-            prompt_id = int(data["input_ids"][0, 0])
-            if prompt_id == 1:
-                await asyncio.sleep(0.01)
-            output = BatchedDataDict(
-                {
-                    "output_ids": torch.tensor([[prompt_id, prompt_id + 10]]),
-                    "generation_lengths": torch.tensor([1]),
-                    "unpadded_sequence_lengths": torch.tensor([2]),
-                    "logprobs": torch.zeros((1, 2)),
-                }
-            )
-            yield 0, output
-
-    inputs = BatchedDataDict(
-        {
-            "input_ids": torch.tensor([[1], [2]]),
-            "input_lengths": torch.tensor([1, 1]),
-        }
-    )
-
-    outputs = asyncio.run(
-        _generate_outputs(
-            generation=FakeAsyncGeneration(),
-            inputs=inputs,
-            use_async=True,
-            pad_token_id=0,
-        )
-    )
-
-    assert outputs["output_ids"].tolist() == [[1, 11], [2, 12]]
+    assert outputs == ["7", "9"]
 
 
 def test_eval_pass_k_basic():
