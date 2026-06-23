@@ -168,6 +168,8 @@ class VllmGeneration(GenerationInterface):
         if self.ep_size > self.tp_size:
             env_vars["VLLM_DP_SIZE"] = str(self.vllm_dp_size)
 
+        env_vars.update(self.cfg.get("env_vars", {}))
+
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:
             # For parallelism, create node-aware worker groups
