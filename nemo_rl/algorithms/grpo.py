@@ -62,6 +62,7 @@ from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_stat
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.mx_helpers import MxConfig
+from nemo_rl.distributed.mx_source_plan import source_candidates_from_results
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -1311,16 +1312,40 @@ def refit_policy_generation(
                 # NB: this is the opposite of the NCCL collective path below,
                 # which MUST run trainer-broadcast and receiver-recv
                 # concurrently (a barrier collective) or it deadlocks.
+                mx_total_start = time.perf_counter()
+                train_submit_start = time.perf_counter()
                 futures_train = policy.stream_weights_via_mx(
                     version=version,
                     mx_config=mx_config,
                     kv_scales=kv_scales,
                 )
-                ray.get(futures_train)
-                futures_inference = policy_generation.update_weights_via_mx(
-                    version=version, mx_config=mx_config
+                train_submit_s = time.perf_counter() - train_submit_start
+                train_wait_start = time.perf_counter()
+                trainer_publish_results = ray.get(futures_train)
+                train_wait_s = time.perf_counter() - train_wait_start
+                trainer_source_candidates = source_candidates_from_results(
+                    trainer_publish_results
                 )
+                inference_submit_start = time.perf_counter()
+                futures_inference = policy_generation.update_weights_via_mx(
+                    version=version,
+                    mx_config=mx_config,
+                    source_candidates=trainer_source_candidates,
+                )
+                inference_submit_s = time.perf_counter() - inference_submit_start
+                inference_wait_start = time.perf_counter()
                 results = ray.get(futures_inference)
+                inference_wait_s = time.perf_counter() - inference_wait_start
+                print(
+                    "[weight-sync-debug][grpo-mx] "
+                    f"version={version} trainer_submit_s={train_submit_s:.3f} "
+                    f"trainer_wait_s={train_wait_s:.3f} "
+                    f"trainer_source_candidates={len(trainer_source_candidates)} "
+                    f"inference_submit_s={inference_submit_s:.3f} "
+                    f"inference_wait_s={inference_wait_s:.3f} "
+                    f"total_s={time.perf_counter() - mx_total_start:.3f}",
+                    flush=True,
+                )
                 update_success = all(result for result in results if result is not None)
             else:
                 # update weights through nccl (default non-colocated path)
@@ -1329,13 +1354,31 @@ def refit_policy_generation(
                     raise NotImplementedError(
                         "SGLang haven't implemented non-colocated inference mode. "
                     )
+                nccl_total_start = time.perf_counter()
+                train_submit_start = time.perf_counter()
                 futures_train = policy.broadcast_weights_for_collective(
                     kv_scales=kv_scales
                 )
+                train_submit_s = time.perf_counter() - train_submit_start
+                inference_submit_start = time.perf_counter()
                 futures_inference = policy_generation.update_weights_from_collective()
+                inference_submit_s = time.perf_counter() - inference_submit_start
                 # wait for all futures to complete
+                train_wait_start = time.perf_counter()
                 ray.get(futures_train)
+                train_wait_s = time.perf_counter() - train_wait_start
+                inference_wait_start = time.perf_counter()
                 results = ray.get(futures_inference)
+                inference_wait_s = time.perf_counter() - inference_wait_start
+                print(
+                    "[weight-sync-debug][grpo-nccl] "
+                    f"trainer_submit_s={train_submit_s:.3f} "
+                    f"inference_submit_s={inference_submit_s:.3f} "
+                    f"trainer_wait_s={train_wait_s:.3f} "
+                    f"inference_wait_s={inference_wait_s:.3f} "
+                    f"total_s={time.perf_counter() - nccl_total_start:.3f}",
+                    flush=True,
+                )
                 update_success = all(result for result in results if result is not None)
 
         # check if update is successful

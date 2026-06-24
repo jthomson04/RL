@@ -1412,6 +1412,16 @@ def test_refit_policy_generation_mx_passes_kv_scales(monkeypatch):
     from nemo_rl.algorithms import grpo as grpo_mod
 
     calls = {}
+    source_candidate = {
+        "format": "nemo_rl.mx_source_candidate.v1",
+        "ref": {
+            "mx_source_id": "source-0",
+            "worker_id": "worker-0",
+            "model_name": "fake-model",
+            "worker_rank": 0,
+            "training_step": 7,
+        },
+    }
 
     class DummyMxConfig:
         enabled = True
@@ -1426,13 +1436,19 @@ def test_refit_policy_generation_mx_passes_kv_scales(monkeypatch):
             return ["train"]
 
     class DummyDynamoGeneration:
-        def update_weights_via_mx(self, *, version, mx_config):
-            calls["receive"] = {"version": version, "mx_config": mx_config}
+        def update_weights_via_mx(self, *, version, mx_config, source_candidates=None):
+            calls["receive"] = {
+                "version": version,
+                "mx_config": mx_config,
+                "source_candidates": source_candidates,
+            }
             return ["infer"]
 
     def fake_ray_get(refs):
         if refs == ["infer"]:
             return [True]
+        if refs == ["train"]:
+            return [source_candidate]
         return refs
 
     mx_config = DummyMxConfig()
@@ -1457,7 +1473,11 @@ def test_refit_policy_generation_mx_passes_kv_scales(monkeypatch):
         "mx_config": mx_config,
         "kv_scales": kv_scales,
     }
-    assert calls["receive"] == {"version": 7, "mx_config": mx_config}
+    assert calls["receive"] == {
+        "version": 7,
+        "mx_config": mx_config,
+        "source_candidates": [source_candidate],
+    }
 
 
 def test_grpo_train_collects_generation_logger_metrics(

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, NotRequired, TypedDict, Union
+from typing import Any, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
@@ -265,6 +265,7 @@ class GenerationInterface(ABC):
         *,
         version: int,
         mx_config: Any,
+        source_candidates: Optional[list[dict[str, Any]]] = None,
     ) -> list[ray.ObjectRef]:
         """Update inference weights from MX server via NIXL RDMA (v2).
 
@@ -276,6 +277,7 @@ class GenerationInterface(ABC):
         Args:
             version: minimum version to accept (filters out stale sources).
             mx_config: an :class:`nemo_rl.distributed.mx_helpers.MxConfig`.
+            source_candidates: Optional exact-version source metadata plan.
 
         Returns:
             List of Ray ObjectRefs — one per inference worker. Driver
