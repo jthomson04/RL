@@ -56,6 +56,52 @@ if TYPE_CHECKING:
 logger = logging.getLogger("nemo_rl.distributed.mx_helpers")
 
 
+def _mx_nic_pin_min_rate() -> float | None:
+    raw_min = os.environ.get("MX_RDMA_NIC_PIN_MIN_RATE_GBPS")
+    if raw_min is None or raw_min.strip() == "":
+        return None
+    try:
+        return float(raw_min)
+    except ValueError:
+        logger.warning(
+            "MX_RDMA_NIC_PIN_MIN_RATE_GBPS=%r not a float; "
+            "falling back to max-rate auto-detect",
+            raw_min,
+        )
+        return None
+
+
+def _apply_stripe_nic_pin_fallback(*, device_id: int, ucx_utils: Any) -> bool:
+    list_compute_nics = getattr(ucx_utils, "_list_compute_ib_nics", None)
+    if list_compute_nics is None:
+        return False
+
+    compute_nics = list_compute_nics(min_rate_gbps=_mx_nic_pin_min_rate())
+    if not compute_nics:
+        logger.warning(
+            "MX_RDMA_NIC_PIN=stripe: no compute IB-class NICs found; skipping pin"
+        )
+        return False
+
+    pinned = ",".join(f"{name}:1" for name, _numa, _rate, _path in compute_nics)
+    prev = os.environ.get("UCX_NET_DEVICES")
+    os.environ["UCX_NET_DEVICES"] = pinned
+    nic_count = len(compute_nics)
+    if nic_count >= 2 and "UCX_MAX_RMA_RAILS" not in os.environ:
+        os.environ["UCX_MAX_RMA_RAILS"] = str(nic_count)
+    os.environ["MX_RDMA_NIC_PIN"] = "off"
+    logger.info(
+        "MX_RDMA_NIC_PIN=stripe fallback: device %d -> UCX_NET_DEVICES=%s "
+        "(was: %s), UCX_MAX_RMA_RAILS=%s, MX_RDMA_NIC_PIN=%s",
+        device_id,
+        pinned,
+        prev,
+        os.environ.get("UCX_MAX_RMA_RAILS"),
+        os.environ.get("MX_RDMA_NIC_PIN"),
+    )
+    return True
+
+
 @dataclass
 class MxConfig:
     """Configuration for the MX path (matches ``cfg.cluster.weight_sync``).
@@ -76,7 +122,8 @@ class MxConfig:
             their EP rank owns. Requires the trainer to set per-layer
             ``owned_expert_ids``.
         nic_pin: NIC pinning strategy passed to ``pin_local_nic``:
-            ``"auto"`` (default) | ``"off"`` | concrete ``"mlx5_<i>"``.
+            ``"auto"`` (default) | ``"stripe"`` | ``"all"`` | ``"off"`` |
+            concrete ``"mlx5_<i>"``.
     """
 
     enabled: bool = False
@@ -112,18 +159,28 @@ def pin_local_nic(*, device_id: int, mode: str = "auto") -> None:
     ``modelexpress.ucx_utils.apply_nic_pin_for_device``. We just call it
     here with the same args NemoRL would use.
     """
-    if mode == "off":
+    mode = mode.strip()
+    normalized_mode = mode.lower()
+    if normalized_mode == "off":
         return
-    try:
-        from modelexpress.ucx_utils import apply_nic_pin_for_device
+    if normalized_mode not in ("auto", "stripe", "all"):
+        os.environ["UCX_NET_DEVICES"] = mode
+        os.environ["MX_RDMA_NIC_PIN"] = "off"  # explicit override
+        logger.info("pinned NIC explicitly: %s", mode)
+        return
 
-        if mode == "auto":
-            apply_nic_pin_for_device(device_id=device_id)
-            logger.info("pinned NIC for device %d (auto)", device_id)
-        else:
-            os.environ["UCX_NET_DEVICES"] = mode
-            os.environ["MX_RDMA_NIC_PIN"] = "off"  # explicit override
-            logger.info("pinned NIC explicitly: %s", mode)
+    try:
+        from modelexpress import ucx_utils
+
+        os.environ["MX_RDMA_NIC_PIN"] = normalized_mode
+        if normalized_mode in ("stripe", "all") and _apply_stripe_nic_pin_fallback(
+            device_id=device_id,
+            ucx_utils=ucx_utils,
+        ):
+            return
+
+        ucx_utils.apply_nic_pin_for_device(device_id=device_id)
+        logger.info("pinned NIC for device %d (%s)", device_id, normalized_mode)
     except Exception as exc:  # noqa: BLE001
         logger.warning("NIC pin failed (mode=%s): %s", mode, exc)
 

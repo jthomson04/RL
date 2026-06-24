@@ -228,8 +228,9 @@ class ColocatablePolicyInterface(PolicyInterface):
                 alongside weights for FP8 KV-cache refit.
 
         Returns:
-            List of Ray ObjectRefs — one per trainer worker. The driver
-            should ``ray.get`` these alongside the inference receivers.
+            List of Ray ObjectRefs — one per trainer worker. Implementations
+            may return JSON-safe source metadata from each future so inference
+            workers can skip MX catalog rediscovery.
 
         Default raises ``NotImplementedError`` so backends that don't
         support the MX path opt-out cleanly.

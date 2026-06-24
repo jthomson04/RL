@@ -14,6 +14,7 @@
 
 import math
 import os
+import time
 from functools import lru_cache
 from typing import Any, List, Tuple
 
@@ -52,6 +53,14 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
     target_packed_tensor_size = get_target_packed_tensor_size()
 
     num_buffers = get_num_buffers()
+    total_start = time.perf_counter()
+    total_bytes = 0
+    total_chunks = 0
+    print(
+        "[weight-sync-debug][packed-nccl-producer] "
+        f"target_chunk_bytes={target_packed_tensor_size} num_buffers={num_buffers}",
+        flush=True,
+    )
     streams = [torch.cuda.Stream() for _ in range(num_buffers)]
     buffer_idx = 0
 
@@ -81,18 +90,52 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
                     if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
                         break
                 # Pack the tensors and call broadcast collective
+                cat_start = time.perf_counter()
                 packed_tensors[buffer_idx] = torch.cat(
                     packing_tensor_list[buffer_idx], dim=0
                 )
+                cat_s = time.perf_counter() - cat_start
+                broadcast_start = time.perf_counter()
                 group.broadcast(packed_tensors[buffer_idx], src=src)
+                broadcast_s = time.perf_counter() - broadcast_start
+                chunk_bytes = packed_tensors[buffer_idx].numel()
+                total_bytes += chunk_bytes
+                total_chunks += 1
+                print(
+                    "[weight-sync-debug][packed-nccl-producer] "
+                    f"chunk={total_chunks} bytes={chunk_bytes} "
+                    f"cat_s={cat_s:.3f} broadcast_s={broadcast_s:.3f}",
+                    flush=True,
+                )
             except StopIteration:
                 # do the last broadcast if there are remaining tensors
                 if len(packing_tensor_list[buffer_idx]) > 0:
+                    cat_start = time.perf_counter()
                     packed_tensors[buffer_idx] = torch.cat(
                         packing_tensor_list[buffer_idx], dim=0
                     )
+                    cat_s = time.perf_counter() - cat_start
+                    broadcast_start = time.perf_counter()
                     group.broadcast(packed_tensors[buffer_idx], src=src)
+                    broadcast_s = time.perf_counter() - broadcast_start
+                    chunk_bytes = packed_tensors[buffer_idx].numel()
+                    total_bytes += chunk_bytes
+                    total_chunks += 1
+                    print(
+                        "[weight-sync-debug][packed-nccl-producer] "
+                        f"chunk={total_chunks} bytes={chunk_bytes} "
+                        f"cat_s={cat_s:.3f} broadcast_s={broadcast_s:.3f}",
+                        flush=True,
+                    )
                 break
+    total_s = time.perf_counter() - total_start
+    print(
+        "[weight-sync-debug][packed-nccl-producer] "
+        f"chunks={total_chunks} total_gb={total_bytes / 1e9:.3f} "
+        f"total_s={total_s:.3f} gbps="
+        f"{(total_bytes * 8) / (total_s * 1e9) if total_s > 0 else 0.0:.1f}",
+        flush=True,
+    )
 
 
 def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
@@ -140,6 +183,14 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
     target_packed_tensor_size = get_target_packed_tensor_size()
 
     num_buffers = get_num_buffers()
+    total_start = time.perf_counter()
+    total_bytes = 0
+    total_chunks = 0
+    print(
+        "[weight-sync-debug][packed-nccl-consumer] "
+        f"target_chunk_bytes={target_packed_tensor_size} num_buffers={num_buffers}",
+        flush=True,
+    )
     streams = [torch.cuda.Stream() for _ in range(num_buffers)]
     buffer_idx = 0
 
@@ -173,31 +224,73 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
                     if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
                         break
                 # Create a packed tensor and broadcast it
+                alloc_start = time.perf_counter()
                 packed_tensors[buffer_idx] = torch.empty(
                     packing_tensor_sizes[buffer_idx], dtype=torch.uint8, device="cuda"
                 )
+                alloc_s = time.perf_counter() - alloc_start
+                broadcast_start = time.perf_counter()
                 group.broadcast(packed_tensors[buffer_idx], src=src)
+                broadcast_s = time.perf_counter() - broadcast_start
                 # Load the packed tensor into the model
-                post_unpack_func(
-                    unpack_tensor(
-                        packed_tensors[buffer_idx], packing_tensor_meta_data[buffer_idx]
-                    )
+                unpack_start = time.perf_counter()
+                unpacked = unpack_tensor(
+                    packed_tensors[buffer_idx], packing_tensor_meta_data[buffer_idx]
+                )
+                unpack_s = time.perf_counter() - unpack_start
+                load_start = time.perf_counter()
+                post_unpack_func(unpacked)
+                load_s = time.perf_counter() - load_start
+                chunk_bytes = packing_tensor_sizes[buffer_idx]
+                total_bytes += chunk_bytes
+                total_chunks += 1
+                print(
+                    "[weight-sync-debug][packed-nccl-consumer] "
+                    f"chunk={total_chunks} bytes={chunk_bytes} "
+                    f"alloc_s={alloc_s:.3f} broadcast_s={broadcast_s:.3f} "
+                    f"unpack_s={unpack_s:.3f} load_s={load_s:.3f}",
+                    flush=True,
                 )
             except StopIteration:
                 # do the last broadcast if there are remaining tensors
                 if len(packing_tensor_meta_data[buffer_idx]) > 0:
                     # Create a packed tensor and broadcast it
+                    alloc_start = time.perf_counter()
                     packed_tensors[buffer_idx] = torch.empty(
                         packing_tensor_sizes[buffer_idx],
                         dtype=torch.uint8,
                         device="cuda",
                     )
+                    alloc_s = time.perf_counter() - alloc_start
+                    broadcast_start = time.perf_counter()
                     group.broadcast(packed_tensors[buffer_idx], src=src)
+                    broadcast_s = time.perf_counter() - broadcast_start
                     # Load the packed tensor into the model
-                    post_unpack_func(
-                        unpack_tensor(
-                            packed_tensors[buffer_idx],
-                            packing_tensor_meta_data[buffer_idx],
-                        )
+                    unpack_start = time.perf_counter()
+                    unpacked = unpack_tensor(
+                        packed_tensors[buffer_idx],
+                        packing_tensor_meta_data[buffer_idx],
+                    )
+                    unpack_s = time.perf_counter() - unpack_start
+                    load_start = time.perf_counter()
+                    post_unpack_func(unpacked)
+                    load_s = time.perf_counter() - load_start
+                    chunk_bytes = packing_tensor_sizes[buffer_idx]
+                    total_bytes += chunk_bytes
+                    total_chunks += 1
+                    print(
+                        "[weight-sync-debug][packed-nccl-consumer] "
+                        f"chunk={total_chunks} bytes={chunk_bytes} "
+                        f"alloc_s={alloc_s:.3f} broadcast_s={broadcast_s:.3f} "
+                        f"unpack_s={unpack_s:.3f} load_s={load_s:.3f}",
+                        flush=True,
                     )
                 break
+    total_s = time.perf_counter() - total_start
+    print(
+        "[weight-sync-debug][packed-nccl-consumer] "
+        f"chunks={total_chunks} total_gb={total_bytes / 1e9:.3f} "
+        f"total_s={total_s:.3f} gbps="
+        f"{(total_bytes * 8) / (total_s * 1e9) if total_s > 0 else 0.0:.1f}",
+        flush=True,
+    )
