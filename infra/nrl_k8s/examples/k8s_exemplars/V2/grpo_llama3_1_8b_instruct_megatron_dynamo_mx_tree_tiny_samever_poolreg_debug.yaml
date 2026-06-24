@@ -1,0 +1,25 @@
+# Instrumented Llama 3.1 8B Megatron async-GRPO benchmark with Dynamo + MX.
+#
+# Tiny pool-registration variant: 4 trainer GPUs and 4 TP1 Dynamo decode
+# replicas. MX tree scale-out is enabled so refit receivers republish
+# themselves as sources. Both trainer and inference workers use striped RoCE.
+
+defaults: grpo_llama3_1_8b_instruct_megatron_dynamo_mx.yaml
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+  weight_sync:
+    method: "mx"
+    mx_config:
+      enabled: true
+      mx_server_url: "modelexpress-server.default.svc.cluster.local:8001"
+      timeout_seconds: 300.0
+      same_rank_only: true
+      tree_scale_out: true
+      moe_expert_filter: false
+      nic_pin: "stripe"
+      retain_latest_k: 1
+
+logger:
+  log_dir: "logs/grpo-llama3-8b-megatron-dynamo-mx-tree-tiny-samever-poolreg-debug"
