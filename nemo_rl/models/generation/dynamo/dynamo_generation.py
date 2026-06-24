@@ -950,6 +950,12 @@ class DynamoGeneration(GenerationInterface):
             "top_p": self.cfg["top_p"],
             "top_k": top_k_val,
             "n": 1,
+            # Request per-token logprobs of the sampled tokens. Without this the
+            # response carries no `token_logprobs`, so `generation_logprobs` is
+            # left all-zero downstream — which silently breaks the importance-
+            # sampling correction (async GRPO) and makes the "Generation KL Error"
+            # metric meaningless (it degenerates to mean |recomputed logprob|).
+            "logprobs": 1,
             "return_tokens_as_token_ids": True,
             "include_stop_str_in_output": True,
             "nvext": {"extra_fields": ["completion_token_ids"]},

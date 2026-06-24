@@ -107,6 +107,12 @@ spec:
             - --max-num-batched-tokens
             - "8192"
             - --enforce-eager
+            # Use vLLM's neutral sampling defaults instead of the model's
+            # generation_config.json (Llama-3.1 bakes temp 0.6 / top_p 0.9),
+            # so generation honors the recipe's requested sampling params and
+            # stays on-policy with the trainer.
+            - --generation-config
+            - vllm
           resources:
             claims:
               - name: roce-channel
