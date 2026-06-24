@@ -796,9 +796,14 @@ class VllmGeneration(GenerationInterface):
         return futures
 
     def update_weights_via_mx(
-        self, *, version: int, mx_config: Any
+        self,
+        *,
+        version: int,
+        mx_config: Any,
+        source_candidates: Optional[list[dict[str, Any]]] = None,
     ) -> list[ray.ObjectRef]:
         """Update weights via ModelExpress + NIXL RDMA (v2 path)."""
+        del source_candidates
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 

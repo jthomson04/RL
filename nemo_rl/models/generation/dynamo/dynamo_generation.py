@@ -30,6 +30,11 @@ import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.mx_source_plan import (
+    dedupe_source_candidates,
+    make_source_plan,
+    source_candidates_from_results,
+)
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.dynamo.config import DynamoConfig
 from nemo_rl.models.generation.interfaces import (
@@ -376,6 +381,7 @@ def _dispatch_update_weights_via_mx_remote(
     refit_timeout_s: float = 300.0,
     admin_timeout_s: float = 30.0,
     max_convergence_iterations: int = 5,
+    source_candidates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Synchronously orchestrate an MX refit cycle that converges over scaling.
 
@@ -413,7 +419,16 @@ def _dispatch_update_weights_via_mx_remote(
         dyn_namespaces = set(worker_namespaces)
     else:
         dyn_namespaces = {f"{k8s_namespace}-{dgd_name}"}
-    payload = {"version": version, "mx_config": mx_config_dict}
+    available_source_candidates = dedupe_source_candidates(source_candidates or [])
+    source_plan_model_name = next(
+        (
+            str(candidate["ref"].get("model_name"))
+            for candidate in available_source_candidates
+            if isinstance(candidate.get("ref"), dict)
+            and candidate["ref"].get("model_name")
+        ),
+        None,
+    )
 
     def _step(
         sys_url: str, route: str, body: dict[str, Any], timeout_s: float
@@ -439,11 +454,21 @@ def _dispatch_update_weights_via_mx_remote(
     # genuinely broken refit still surfaces instead of hanging forever.
     import time as _time
 
+    cycle_start = _time.monotonic()
+    print(
+        "[weight-sync-debug][mx-dynamo] "
+        f"version={version} dgd={dgd_name} namespaces={sorted(dyn_namespaces)} "
+        f"tree_scale_out={mx_config_dict.get('tree_scale_out')} "
+        f"initial_source_candidates={len(available_source_candidates)}",
+        flush=True,
+    )
     _cycle_deadline = _time.monotonic() + float(
         mx_config_dict.get("timeout_seconds", 300.0)
     )
 
     for iteration in range(max_convergence_iterations):
+        discover_start = _time.monotonic()
+        discover_attempts = 1
         if iteration == 0:
             # On the first pass, the worker pod may be container-Ready but
             # not yet registered in the frontend's discovery system. Retry
@@ -452,6 +477,7 @@ def _dispatch_update_weights_via_mx_remote(
 
             instances = []
             for _attempt in range(20):
+                discover_attempts = _attempt + 1
                 instances = _discover_worker_instances(
                     frontend_host=frontend_host,
                     frontend_port=frontend_port,
@@ -477,20 +503,32 @@ def _dispatch_update_weights_via_mx_remote(
                 dyn_system_port=dyn_system_port,
             )
 
+        discover_s = _time.monotonic() - discover_start
         new_instances = [i for i in instances if i["instance_id"] not in refitted_ids]
         iter_log = {
             "iteration": iteration,
             "discovered": len(instances),
             "new": len(new_instances),
             "already_refitted": len(refitted_ids),
+            "discover_s": round(discover_s, 3),
+            "discover_attempts": discover_attempts,
         }
+        print(
+            "[weight-sync-debug][mx-dynamo] "
+            f"version={version} iteration={iteration} "
+            f"discovered={len(instances)} new={len(new_instances)} "
+            f"already_refitted={len(refitted_ids)} "
+            f"discover_attempts={discover_attempts} discover_s={discover_s:.3f}",
+            flush=True,
+        )
         if not new_instances:
             iteration_logs.append(iter_log)
             break  # converged: every live worker has been refitted
 
         # Tree fan-out: fire refits in exponentially-growing waves.
-        # Wave k has up to FANOUT**k pods running in parallel. After
-        # each wave, the freshly-published inference_replicas become
+        # Wave k has up to FANOUT**k pods running in parallel, so the
+        # first wave starts with FANOUT receivers instead of only one.
+        # After each wave, the freshly-published inference_replicas become
         # sources for the next wave; the picker random-picks among
         # them so load spreads across NICs rather than serializing
         # on the trainer. FANOUT=4 picked to match the receiver-side
@@ -500,7 +538,10 @@ def _dispatch_update_weights_via_mx_remote(
         FANOUT = 4
         import concurrent.futures
 
-        def _refit_one(inst: dict[str, Any]) -> tuple[Any, list[str], dict[str, Any]]:
+        def _refit_one(
+            inst: dict[str, Any],
+            source_plan: dict[str, Any] | None,
+        ) -> tuple[Any, list[str], dict[str, Any], list[dict[str, Any]]]:
             """One pod's refit (with retry) → flush.
 
             No pause/resume around the refit: ``update_weights_via_mx`` runs as
@@ -516,20 +557,24 @@ def _dispatch_update_weights_via_mx_remote(
             reset_prefix_cache, dropping prefix-cache entries computed on the
             old weights.
 
-            Returns ``(instance_id, failure_msgs, steps)``. Designed to
+            Returns ``(instance_id, failure_msgs, steps, source_candidates)``. Designed to
             run in a worker thread inside the wave-parallel executor.
             """
             sys_url = inst["system_url"]
             inst_id = inst["instance_id"]
             steps: dict[str, Any] = {}
             failure_msgs: list[str] = []
+            refit_payload = {"version": version, "mx_config": mx_config_dict}
+            if source_plan is not None:
+                refit_payload["source_plan"] = source_plan
 
             attempt = 0
             r_refit = {"status": "error", "reason": "not attempted"}
+            refit_start = _time.monotonic()
             while True:
                 attempt += 1
                 r_refit = _step(
-                    sys_url, "update_weights_via_mx", payload, refit_timeout_s
+                    sys_url, "update_weights_via_mx", refit_payload, refit_timeout_s
                 )
                 steps["refit"] = r_refit
                 if r_refit.get("status") == "ok":
@@ -542,36 +587,90 @@ def _dispatch_update_weights_via_mx_remote(
                     break
                 _time.sleep(min(3.0, 0.5 * attempt))
             steps["refit_attempts"] = attempt
+            refit_s = _time.monotonic() - refit_start
+            steps["refit_wall_s"] = round(refit_s, 3)
 
+            flush_start = _time.monotonic()
             r_flush = _step(sys_url, "flush_cache", {}, admin_timeout_s)
+            flush_s = _time.monotonic() - flush_start
             steps["flush"] = r_flush
+            steps["flush_wall_s"] = round(flush_s, 3)
             if r_flush.get("status") not in ("ok", None):
                 failure_msgs.append(f"flush@{sys_url}({inst_id}): {r_flush}")
 
-            return inst_id, failure_msgs, steps
+            print(
+                "[weight-sync-debug][mx-dynamo] "
+                f"version={version} instance={inst_id} "
+                f"refit_status={r_refit.get('status')} "
+                f"refit_attempts={attempt} refit_s={refit_s:.3f} "
+                f"flush_status={r_flush.get('status')} flush_s={flush_s:.3f}",
+                flush=True,
+            )
+            return (
+                inst_id,
+                failure_msgs,
+                steps,
+                source_candidates_from_results(r_refit),
+            )
 
         wave_logs: list[dict[str, Any]] = []
         remaining = list(new_instances)
         wave_idx = 0
         while remaining:
             wave_idx += 1
-            wave_size = min(len(remaining), FANOUT**wave_idx)
+            if mx_config_dict.get("tree_scale_out"):
+                wave_size = min(len(remaining), FANOUT**wave_idx)
+            else:
+                wave_size = len(remaining)
             wave = remaining[:wave_size]
             remaining = remaining[wave_size:]
             wave_start = _time.monotonic()
+            source_plan = None
+            if available_source_candidates:
+                source_plan = make_source_plan(
+                    version=int(version),
+                    candidates=available_source_candidates,
+                    model_name=source_plan_model_name,
+                )
+                source_plan_candidates = source_plan.get("candidates", [])
+            else:
+                source_plan_candidates = []
+            print(
+                "[weight-sync-debug][mx-dynamo] "
+                f"version={version} iteration={iteration} wave={wave_idx} "
+                f"planned_source_candidates={len(source_plan_candidates)}",
+                flush=True,
+            )
+            wave_source_candidates: list[dict[str, Any]] = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(wave)) as ex:
-                futures = [ex.submit(_refit_one, inst) for inst in wave]
+                futures = [ex.submit(_refit_one, inst, source_plan) for inst in wave]
                 for fut in concurrent.futures.as_completed(futures):
-                    inst_id, fmsgs, _steps = fut.result()
+                    inst_id, fmsgs, _steps, returned_candidates = fut.result()
                     refitted_ids.add(inst_id)
                     if fmsgs:
                         failures.extend(fmsgs)
+                    wave_source_candidates.extend(returned_candidates)
+            if wave_source_candidates:
+                available_source_candidates = dedupe_source_candidates(
+                    [*available_source_candidates, *wave_source_candidates]
+                )
             wave_logs.append(
                 {
                     "wave": wave_idx,
                     "size": len(wave),
                     "wall_s": round(_time.monotonic() - wave_start, 3),
+                    "planned_source_candidates": len(source_plan_candidates),
+                    "returned_source_candidates": len(wave_source_candidates),
+                    "available_source_candidates": len(available_source_candidates),
                 }
+            )
+            print(
+                "[weight-sync-debug][mx-dynamo] "
+                f"version={version} iteration={iteration} wave={wave_idx} "
+                f"size={len(wave)} wall_s={_time.monotonic() - wave_start:.3f} "
+                f"returned_source_candidates={len(wave_source_candidates)} "
+                f"available_source_candidates={len(available_source_candidates)}",
+                flush=True,
             )
 
         iter_log["refitted_this_pass"] = len(new_instances)
@@ -592,6 +691,13 @@ def _dispatch_update_weights_via_mx_remote(
             f"[mx] update_weights_via_mx(version={version}) refit cycle "
             f"failed: " + " | ".join(failures[:3])
         )
+    print(
+        "[weight-sync-debug][mx-dynamo] "
+        f"version={version} workers_refitted={len(refitted_ids)} "
+        f"iterations={len(iteration_logs)} "
+        f"total_s={_time.monotonic() - cycle_start:.3f}",
+        flush=True,
+    )
     return {
         "status": "ok",
         "version": version,
@@ -1306,6 +1412,7 @@ class DynamoGeneration(GenerationInterface):
         *,
         version: int,
         mx_config: Any,
+        source_candidates: Optional[list[dict[str, Any]]] = None,
     ) -> list[ray.ObjectRef]:
         """Synchronously trigger refit on every DGD VllmDecodeWorker.
 
@@ -1356,5 +1463,6 @@ class DynamoGeneration(GenerationInterface):
             version=int(version),
             mx_config_dict=mx_config_dict,
             worker_namespaces=worker_namespaces,
+            source_candidates=source_candidates,
         )
         return [ref]

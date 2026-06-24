@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import hashlib
+import os
+import secrets
 import time
 import traceback
 from typing import Any
@@ -67,13 +70,197 @@ def _target_tp(worker: Any) -> tuple[int, int]:
     return tp_size, tp_rank
 
 
+def _mx_candidate_version(candidate: Any) -> int | None:
+    try:
+        return int(candidate.ref.training_step)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _mx_candidate_role(candidate: Any) -> str:
+    return str(getattr(candidate, "role", ""))
+
+
+def _mx_is_inference_replica(candidate: Any) -> bool:
+    return _mx_candidate_role(candidate) == "inference_replica"
+
+
+def _mx_is_compatible_megatron_trainer(
+    candidate: Any,
+    *,
+    target_tp_rank: int,
+    target_tp_size: int,
+) -> bool:
+    if _mx_candidate_role(candidate) != "trainer":
+        return False
+    megatron_meta = getattr(candidate, "megatron_meta", None)
+    if megatron_meta is None:
+        return False
+    try:
+        source_tp_rank = int(megatron_meta.tp_rank)
+        source_tp_size = int(megatron_meta.tp_size)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return source_tp_rank == target_tp_rank and source_tp_size == target_tp_size
+
+
+def _mx_is_compatible_megatron_replica(
+    candidate: Any,
+    *,
+    target_tp_rank: int,
+) -> bool:
+    if not _mx_is_inference_replica(candidate):
+        return False
+    try:
+        return int(candidate.worker_rank) == target_tp_rank
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _mx_candidate_source_key(candidate: Any) -> tuple[str, str, str, str]:
+    ref = getattr(candidate, "ref", None)
+    return (
+        str(getattr(ref, "mx_source_id", "")),
+        str(getattr(ref, "worker_id", "")),
+        str(getattr(candidate, "worker_rank", "")),
+        _mx_candidate_role(candidate),
+    )
+
+
+def _mx_candidate_source_key_str(candidate: Any | None) -> str:
+    if candidate is None:
+        return "none"
+    source_id, worker_id, worker_rank, role = _mx_candidate_source_key(candidate)
+    return f"{role}:{worker_rank}:{source_id}:{worker_id}"
+
+
+def _mx_source_selector_key(*, version: int, worker_rank: Any) -> str:
+    return "|".join(
+        (
+            str(version),
+            str(worker_rank),
+            os.environ.get("POD_NAME", ""),
+            os.environ.get("HOSTNAME", ""),
+            os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+            os.environ.get("LOCAL_RANK", ""),
+            os.environ.get("RANK", ""),
+            str(os.getpid()),
+        )
+    )
+
+
+def _mx_source_rendezvous_score(candidate: Any, selector_key: str) -> bytes:
+    h = hashlib.blake2b(digest_size=16)
+    h.update(selector_key.encode("utf-8", errors="replace"))
+    for part in _mx_candidate_source_key(candidate):
+        h.update(b"\0")
+        h.update(part.encode("utf-8", errors="replace"))
+    return h.digest()
+
+
+def _choose_from_megatron_pool(
+    candidates: list[Any],
+    *,
+    selector_key: str | None,
+) -> Any:
+    if selector_key:
+        return max(
+            candidates,
+            key=lambda candidate: (
+                _mx_source_rendezvous_score(candidate, selector_key),
+                _mx_candidate_source_key(candidate),
+            ),
+        )
+    return secrets.choice(candidates)
+
+
+def _choose_megatron_bulk_source(
+    candidates: list[Any],
+    *,
+    version: int,
+    target_tp_rank: int,
+    target_tp_size: int,
+    selector_key: str | None = None,
+) -> tuple[Any | None, dict[str, Any]]:
+    stats = {
+        "total": len(candidates),
+        "same_version": 0,
+        "missing_version": 0,
+        "stale_version": 0,
+        "future_version": 0,
+        "eligible_trainers": 0,
+        "eligible_replicas": 0,
+        "selection_pool": "none",
+        "selection_pool_size": 0,
+    }
+    eligible_trainers: list[Any] = []
+    eligible_replicas: list[Any] = []
+    for candidate in candidates:
+        candidate_version = _mx_candidate_version(candidate)
+        if candidate_version is None:
+            stats["missing_version"] += 1
+            continue
+        if candidate_version < version:
+            stats["stale_version"] += 1
+            continue
+        if candidate_version > version:
+            stats["future_version"] += 1
+            continue
+
+        stats["same_version"] += 1
+        if _mx_is_compatible_megatron_trainer(
+            candidate,
+            target_tp_rank=target_tp_rank,
+            target_tp_size=target_tp_size,
+        ):
+            stats["eligible_trainers"] += 1
+            eligible_trainers.append(candidate)
+        elif _mx_is_compatible_megatron_replica(
+            candidate,
+            target_tp_rank=target_tp_rank,
+        ):
+            stats["eligible_replicas"] += 1
+            eligible_replicas.append(candidate)
+
+    if eligible_replicas:
+        stats["selection_pool"] = "inference_replica"
+        stats["selection_pool_size"] = len(eligible_replicas)
+        return (
+            _choose_from_megatron_pool(
+                eligible_replicas,
+                selector_key=selector_key
+                or _mx_source_selector_key(
+                    version=version,
+                    worker_rank=target_tp_rank,
+                ),
+            ),
+            stats,
+        )
+    if eligible_trainers:
+        stats["selection_pool"] = "trainer"
+        stats["selection_pool_size"] = len(eligible_trainers)
+        return (
+            _choose_from_megatron_pool(
+                eligible_trainers,
+                selector_key=selector_key
+                or _mx_source_selector_key(
+                    version=version,
+                    worker_rank=target_tp_rank,
+                ),
+            ),
+            stats,
+        )
+    else:
+        return None, stats
+
+
 def _param_for_loaded_weight(
     name: str,
     params: dict[str, torch.Tensor],
 ) -> torch.Tensor | None:
     candidates = [name]
     if name.startswith("backbone."):
-        candidates.append(f"model.{name[len('backbone.'):]}")
+        candidates.append(f"model.{name[len('backbone.') :]}")
     for candidate in candidates:
         param = params.get(candidate)
         if param is not None:
@@ -540,11 +727,23 @@ class VllmInternalWorkerExtension:
                 self._mx_receiver.initialize(model_tensors=receive_buffers)
                 self._mx_recv_buffers = receive_buffers
 
+            loaded_version = int(getattr(self, "_mx_loaded_version", -1))
+            if loaded_version >= int(version):
+                print(
+                    "[weight-sync-debug][mx-vllm] "
+                    f"rank={self._mx_receiver.worker_rank} version={version} "
+                    f"already_loaded_version={loaded_version}; skipping refit",
+                    flush=True,
+                )
+                return True
+
             # ---- Discover, pick, and pull ----
             candidates = self._mx_receiver.discover_v2_sources(
                 model_name=self.model_config.model
                 if hasattr(self.model_config, "model")
-                else getattr(self.model_runner.vllm_config.model_config, "model", "unknown"),
+                else getattr(
+                    self.model_runner.vllm_config.model_config, "model", "unknown"
+                ),
                 min_version=int(version),
                 same_rank_only=mx_config.same_rank_only,
                 include_replicas=mx_config.tree_scale_out,
@@ -570,7 +769,9 @@ class VllmInternalWorkerExtension:
 
             if self._mx_megatron_mode:
                 return self._update_weights_via_mx_megatron(
-                    candidates=candidates, version=int(version), mx_config=mx_config,
+                    candidates=candidates,
+                    version=int(version),
+                    mx_config=mx_config,
                 )
 
             chosen = self._mx_receiver.pick_best_source(candidates)
@@ -629,6 +830,7 @@ class VllmInternalWorkerExtension:
 
             gc.collect()
             torch.cuda.empty_cache()
+            self._mx_loaded_version = int(version)
             return True
         except Exception as e:
             print(
@@ -643,11 +845,15 @@ class VllmInternalWorkerExtension:
         candidates: list,
         ctx: Any,
         mx_config: Any,
-    ) -> None:
+    ) -> tuple[int, int, float, float]:
         vocab_buffers = getattr(self, "_mx_megatron_vocab_buffers", {})
         if not vocab_buffers:
-            return
+            return 0, 0, 0.0, 0.0
 
+        wall_start = time.perf_counter()
+        total_bytes = 0
+        total_slices = 0
+        total_transfer_s = 0.0
         megatron_cands = sorted(
             [c for c in candidates if c.megatron_meta is not None],
             key=lambda c: c.megatron_meta.tp_rank,
@@ -671,11 +877,27 @@ class VllmInternalWorkerExtension:
                     )
                 batch.append((name, None, view))
             if batch:
-                self._mx_receiver._receiver.pull_to(
-                    cand.ref,
-                    batch,
-                    timeout_seconds=mx_config.timeout_seconds,
+                bytes_transferred, slices, transfer_s = (
+                    self._mx_receiver._receiver.pull_to(
+                        cand.ref,
+                        batch,
+                        timeout_seconds=mx_config.timeout_seconds,
+                    )
                 )
+                total_bytes += bytes_transferred
+                total_slices += slices
+                total_transfer_s += transfer_s
+        wall_s = time.perf_counter() - wall_start
+        print(
+            "[weight-sync-debug][mx-vllm] "
+            f"rank={getattr(self._mx_receiver, 'worker_rank', '?')} "
+            f"vocab_pull_slices={total_slices} "
+            f"vocab_pull_gb={total_bytes / 1e9:.3f} "
+            f"vocab_transfer_s={total_transfer_s:.3f} "
+            f"vocab_wall_s={wall_s:.3f}",
+            flush=True,
+        )
+        return total_bytes, total_slices, total_transfer_s, wall_s
 
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_via_mx_megatron"
@@ -711,9 +933,68 @@ class VllmInternalWorkerExtension:
             TargetTpLayout,
         )
 
+        total_start = time.perf_counter()
+        mem_start = torch.cuda.memory_allocated(self.device)
+        worker_rank = getattr(getattr(self, "_mx_receiver", None), "worker_rank", "?")
+        print(
+            "[weight-sync-debug][mx-vllm] "
+            f"rank={worker_rank} version={version} "
+            f"candidates={len(candidates)} megatron_refit_start",
+            flush=True,
+        )
+        exact_candidates = [
+            candidate
+            for candidate in candidates
+            if _mx_candidate_version(candidate) == int(version)
+        ]
+        stale_candidates = sum(
+            1
+            for candidate in candidates
+            if (
+                _mx_candidate_version(candidate) is not None
+                and _mx_candidate_version(candidate) < int(version)
+            )
+        )
+        future_candidates = sum(
+            1
+            for candidate in candidates
+            if (
+                _mx_candidate_version(candidate) is not None
+                and _mx_candidate_version(candidate) > int(version)
+            )
+        )
+        print(
+            "[weight-sync-debug][mx-vllm] "
+            f"rank={worker_rank} version={version} "
+            f"exact_candidates={len(exact_candidates)} "
+            f"stale_candidates={stale_candidates} "
+            f"future_candidates={future_candidates}",
+            flush=True,
+        )
+        if not exact_candidates:
+            print(
+                "[mx-megatron] no exact-version source available for "
+                f"version={version}; retrying later"
+            )
+            return False
+        candidates = exact_candidates
+        megatron_context_candidates = [
+            candidate
+            for candidate in candidates
+            if getattr(candidate, "megatron_meta", None) is not None
+        ]
+        if not megatron_context_candidates:
+            print(
+                "[mx-megatron] no exact-version Megatron trainer metadata "
+                f"available for version={version}; retrying later"
+            )
+            return False
+
         # ---- One-shot: build context from the first cycle's metadata. ----
+        context_s = 0.0
         if not hasattr(self, "_mx_megatron_ctx") or self._mx_megatron_ctx is None:
-            cfg, name_map = discover_megatron_context(candidates)
+            context_start = time.perf_counter()
+            cfg, name_map = discover_megatron_context(megatron_context_candidates)
             if cfg is None:
                 print(
                     "[mx-megatron] sources advertise publisher_kind=megatron but "
@@ -735,7 +1016,8 @@ class VllmInternalWorkerExtension:
                 else 0
             )
             target_tp_layout = TargetTpLayout(
-                tp_size=target_tp, tp_rank=target_tp_rank,
+                tp_size=target_tp,
+                tp_rank=target_tp_rank,
             )
 
             # For each Megatron source-name → list of HF target names, build
@@ -743,7 +1025,7 @@ class VllmInternalWorkerExtension:
             # TensorDescriptorV2 in the published shape_registry; the
             # receiver-side parser is in modelexpress.nemo_rl_v2.
             receive_specs: dict[str, ReceiveSpec] = {}
-            for cand in candidates:
+            for cand in megatron_context_candidates:
                 if cand.megatron_meta is None or cand.registry is None:
                     continue
                 for td in cand.registry.get("tensors", []):
@@ -757,10 +1039,13 @@ class VllmInternalWorkerExtension:
                     # be defensive in case a publisher emits the `module.`
                     # prefix and the name_map doesn't.
                     lookup_name = (
-                        td.name[len("module."):] if td.name.startswith("module.")
+                        td.name[len("module.") :]
+                        if td.name.startswith("module.")
                         else td.name
                     )
-                    hf_names = name_map.get(lookup_name, name_map.get(td.name, [td.name]))
+                    hf_names = name_map.get(
+                        lookup_name, name_map.get(td.name, [td.name])
+                    )
                     receive_specs[td.name] = ReceiveSpec(
                         megatron_name=td.name,
                         hf_names=list(hf_names),
@@ -782,6 +1067,14 @@ class VllmInternalWorkerExtension:
                 f"[mx-megatron] built receive context: tp={target_tp} "
                 f"tensors={len(receive_specs)} cfg={cfg}"
             )
+            context_s = time.perf_counter() - context_start
+            print(
+                "[weight-sync-debug][mx-vllm] "
+                f"rank={worker_rank} version={version} "
+                f"context_build_s={context_s:.3f} "
+                f"receive_specs={len(receive_specs)}",
+                flush=True,
+            )
 
         # ---- One refit cycle, matched-TP fast path. ----
         # v0: pre-allocate one Megatron-shaped destination per receive_spec,
@@ -797,12 +1090,14 @@ class VllmInternalWorkerExtension:
         # plumbing for partial-buffer registers.
         ctx = self._mx_megatron_ctx
         if not hasattr(self, "_mx_megatron_buffers"):
+            prealloc_start = time.perf_counter()
+            prealloc_mem_start = torch.cuda.memory_allocated(self.device)
             buffers: dict[str, "torch.Tensor"] = {}
             vocab_buffers: dict[str, "torch.Tensor"] = {}
             source_tp_size = next(
                 (
                     c.megatron_meta.tp_size
-                    for c in candidates
+                    for c in megatron_context_candidates
                     if c.megatron_meta is not None and c.megatron_meta.tp_size > 0
                 ),
                 ctx.target_tp_layout.tp_size,
@@ -816,7 +1111,8 @@ class VllmInternalWorkerExtension:
                     # builds per-expert buffers as part of assembly.
                     continue
                 dt = {
-                    "bfloat16": torch.bfloat16, "float16": torch.float16,
+                    "bfloat16": torch.bfloat16,
+                    "float16": torch.float16,
                     "float32": torch.float32,
                 }.get(spec.target_dtype, torch.bfloat16)
                 target = buffers
@@ -827,7 +1123,9 @@ class VllmInternalWorkerExtension:
                 # shape. Vocab tensors are the exception: vLLM's loader wants
                 # the full vocab tensor and slices it internally for TP.
                 target[spec.megatron_name] = torch.empty(
-                    full_shape, dtype=dt, device=self.device,
+                    full_shape,
+                    dtype=dt,
+                    device=self.device,
                 )
             # Register all at once with the receiver's NIXL plane.
             all_buffers = dict(buffers)
@@ -841,44 +1139,112 @@ class VllmInternalWorkerExtension:
                 f"{len(vocab_buffers)} full-vocab buffers "
                 f"({sum(b.numel() * b.element_size() for b in all_buffers.values()) / 1e9:.2f} GB)"
             )
+            print(
+                "[weight-sync-debug][mx-vllm] "
+                f"rank={worker_rank} version={version} "
+                f"prealloc_register_s={time.perf_counter() - prealloc_start:.3f} "
+                f"prealloc_gb="
+                f"{sum(b.numel() * b.element_size() for b in all_buffers.values()) / 1e9:.3f} "
+                f"cuda_mem_delta_gb="
+                f"{(torch.cuda.memory_allocated(self.device) - prealloc_mem_start) / 1e9:.3f}",
+                flush=True,
+            )
+        else:
+            print(
+                "[weight-sync-debug][mx-vllm] "
+                f"rank={worker_rank} version={version} reuse_preallocated_buffers "
+                f"buffer_count={len(self._mx_megatron_buffers)} "
+                f"vocab_buffer_count={len(getattr(self, '_mx_megatron_vocab_buffers', {}))}",
+                flush=True,
+            )
 
         # Choose between matched-TP fast path and mixed-TP per-source path.
         # Matched-TP requires the source's TP-world to equal the receiver's
         # TP-world AND there to exist a source at our tp_rank. Otherwise
         # fall through to the multi-source path.
-        matched = next(
-            (c for c in candidates
-             if c.megatron_meta is not None
-             and c.megatron_meta.tp_rank == ctx.target_tp_layout.tp_rank),
-            None,
+        matched, selection_stats = _choose_megatron_bulk_source(
+            candidates,
+            version=int(version),
+            target_tp_rank=int(ctx.target_tp_layout.tp_rank),
+            target_tp_size=int(ctx.target_tp_layout.tp_size),
         )
         any_megatron_tp_size = next(
-            (c.megatron_meta.tp_size for c in candidates
-             if c.megatron_meta is not None and c.megatron_meta.tp_size > 0),
+            (
+                c.megatron_meta.tp_size
+                for c in megatron_context_candidates
+                if c.megatron_meta is not None and c.megatron_meta.tp_size > 0
+            ),
             None,
         )
         target_tp_size = ctx.target_tp_layout.tp_size
-        is_matched_tp = (
-            matched is not None
-            and (any_megatron_tp_size is None or any_megatron_tp_size == target_tp_size)
+        is_matched_tp = matched is not None and (
+            any_megatron_tp_size is None or any_megatron_tp_size == target_tp_size
+        )
+        print(
+            "[weight-sync-debug][mx-vllm] "
+            f"rank={worker_rank} version={version} "
+            f"selection_total={selection_stats['total']} "
+            f"selection_same_version={selection_stats['same_version']} "
+            f"selection_missing_version={selection_stats['missing_version']} "
+            f"selection_stale={selection_stats['stale_version']} "
+            f"selection_future={selection_stats['future_version']} "
+            f"eligible_trainers={selection_stats['eligible_trainers']} "
+            f"eligible_replicas={selection_stats['eligible_replicas']} "
+            f"selection_pool={selection_stats['selection_pool']} "
+            f"selection_pool_size={selection_stats['selection_pool_size']} "
+            f"chosen_role={_mx_candidate_role(matched) if matched is not None else 'none'} "
+            f"chosen_worker_rank={getattr(matched, 'worker_rank', 'none') if matched is not None else 'none'} "
+            f"chosen_source_id={getattr(getattr(matched, 'ref', None), 'mx_source_id', 'none') if matched is not None else 'none'} "
+            f"chosen_worker_id={getattr(getattr(matched, 'ref', None), 'worker_id', 'none') if matched is not None else 'none'} "
+            f"chosen_source_key={_mx_candidate_source_key_str(matched)}",
+            flush=True,
         )
 
         weights: list[tuple[str, "torch.Tensor"]] = []
 
         if is_matched_tp:
             # Bulk RDMA pull — single source, one wire transfer.
-            self._mx_receiver._receiver._nixl.rebind_tensors(
-                self._mx_megatron_buffers
+            matched_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in self._mx_megatron_buffers.values()
             )
+            rebind_start = time.perf_counter()
+            self._mx_receiver._receiver._nixl.rebind_tensors(self._mx_megatron_buffers)
+            rebind_s = time.perf_counter() - rebind_start
+            receive_start = time.perf_counter()
+            received_tensors = 0
             for _name, _t in self._mx_receiver.receive_from(
-                matched, timeout_seconds=mx_config.timeout_seconds,
+                matched,
+                timeout_seconds=mx_config.timeout_seconds,
             ):
+                received_tensors += 1
                 pass  # buffers filled in-place via NIXL
+            receive_s = time.perf_counter() - receive_start
+            receive_gbps = (
+                (matched_bytes * 8) / (receive_s * 1e9) if receive_s > 0 else 0.0
+            )
+            print(
+                "[weight-sync-debug][mx-vllm] "
+                f"rank={worker_rank} version={version} matched_tp_receive "
+                f"source_role={_mx_candidate_role(matched)} "
+                f"source_rank={matched.worker_rank} "
+                f"source_version={_mx_candidate_version(matched)} "
+                f"source_id={matched.ref.mx_source_id} "
+                f"source_worker_id={matched.ref.worker_id} "
+                f"source_key={_mx_candidate_source_key_str(matched)} "
+                f"rebind_s={rebind_s:.3f} "
+                f"received_tensors={received_tensors} "
+                f"receive_gb={matched_bytes / 1e9:.3f} "
+                f"receive_s={receive_s:.3f} receive_gbps={receive_gbps:.1f}",
+                flush=True,
+            )
 
-            self._mx_pull_megatron_vocab_buffers(
-                candidates=candidates,
-                ctx=ctx,
-                mx_config=mx_config,
+            vocab_bytes, vocab_slices, vocab_transfer_s, vocab_wall_s = (
+                self._mx_pull_megatron_vocab_buffers(
+                    candidates=megatron_context_candidates,
+                    ctx=ctx,
+                    mx_config=mx_config,
+                )
             )
 
             # pre_assembled_buffers tells run_refit_cycle to use the
@@ -889,15 +1255,27 @@ class VllmInternalWorkerExtension:
 
             pre_assembled_buffers = dict(self._mx_megatron_buffers)
             pre_assembled_buffers.update(self._mx_megatron_vocab_buffers)
+            translate_start = time.perf_counter()
             for hf_name, hf_tensor in run_refit_cycle(
                 self._mx_receiver,
-                candidates=candidates,
+                candidates=megatron_context_candidates,
                 context=ctx,
                 pull=_noop_pull,
                 device=self.device,
                 pre_assembled_buffers=pre_assembled_buffers,
             ):
                 weights.append((hf_name, hf_tensor))
+            translate_s = time.perf_counter() - translate_start
+            print(
+                "[weight-sync-debug][mx-vllm] "
+                f"rank={worker_rank} version={version} matched_tp_translate "
+                f"weights={len(weights)} translate_s={translate_s:.3f} "
+                f"vocab_gb={vocab_bytes / 1e9:.3f} "
+                f"vocab_slices={vocab_slices} "
+                f"vocab_transfer_s={vocab_transfer_s:.3f} "
+                f"vocab_wall_s={vocab_wall_s:.3f}",
+                flush=True,
+            )
         else:
             # Mixed-TP (target_tp != source_tp) or per-expert.
             #
@@ -918,7 +1296,7 @@ class VllmInternalWorkerExtension:
             #     for axis-0 roles by pulling only the sub-slice each
             #     receiver needs from each source rank. Row-parallel
             #     stays at v0 cost.
-            megatron_cands = [c for c in candidates if c.megatron_meta is not None]
+            megatron_cands = list(megatron_context_candidates)
             print(
                 f"[mx-megatron] mixed-TP path: target_tp={target_tp_size} "
                 f"source_tp={any_megatron_tp_size or '?'} "
@@ -949,12 +1327,15 @@ class VllmInternalWorkerExtension:
 
             # ------ Phase 1: pre-allocate + classify per-plan dests ------
             dt_map = {
-                "bfloat16": torch.bfloat16, "float16": torch.float16,
+                "bfloat16": torch.bfloat16,
+                "float16": torch.float16,
                 "float32": torch.float32,
             }
             plan_dests: dict[str, "torch.Tensor"] = {}
             # Per-source pull batches: cand_sid -> list[(name, subslice, dest_view)]
-            v1_batches: dict[str, list] = {c.ref.mx_source_id: [] for c in megatron_cands}
+            v1_batches: dict[str, list] = {
+                c.ref.mx_source_id: [] for c in megatron_cands
+            }
             # Plans that need the v0 scratch path (non-contiguous narrows
             # OR per_expert dict assembly).
             v0_plans: list = []
@@ -1020,12 +1401,16 @@ class VllmInternalWorkerExtension:
                 if not batch:
                     continue
                 xferred, n_slices, elapsed = self._mx_receiver._receiver.pull_to(
-                    cand.ref, batch, timeout_seconds=mx_config.timeout_seconds,
+                    cand.ref,
+                    batch,
+                    timeout_seconds=mx_config.timeout_seconds,
                 )
                 v1_total_bytes += xferred
             v1_elapsed = time.perf_counter() - t0
             if n_v1_slices:
-                v1_bw = (v1_total_bytes * 8) / (v1_elapsed * 1e9) if v1_elapsed > 0 else 0
+                v1_bw = (
+                    (v1_total_bytes * 8) / (v1_elapsed * 1e9) if v1_elapsed > 0 else 0
+                )
                 print(
                     f"[mx-megatron] v1 pull complete: {n_v1_slices} slices, "
                     f"{v1_total_bytes / 1e9:.2f} GB, {v1_elapsed:.2f}s, "
@@ -1040,12 +1425,15 @@ class VllmInternalWorkerExtension:
                 for plan in v0_plans:
                     for src in plan.sources:
                         v0_source_ids.add(src.mx_source_id)
-                v0_cands = [c for c in megatron_cands if c.ref.mx_source_id in v0_source_ids]
+                v0_cands = [
+                    c for c in megatron_cands if c.ref.mx_source_id in v0_source_ids
+                ]
                 t0 = time.perf_counter()
                 for cand in v0_cands:
                     buf_dict: dict[str, "torch.Tensor"] = {}
                     for name, t in self._mx_receiver._receiver.receive_weights_scratch(
-                        cand.ref, timeout_seconds=mx_config.timeout_seconds,
+                        cand.ref,
+                        timeout_seconds=mx_config.timeout_seconds,
                     ):
                         buf_dict[name] = t
                     scratch[cand.ref.mx_source_id] = buf_dict
@@ -1058,6 +1446,7 @@ class VllmInternalWorkerExtension:
             from modelexpress.megatron_translator import (
                 assemble_into_destination,
             )
+
             for plan in plans:
                 if not plan.sources:
                     continue
@@ -1091,12 +1480,17 @@ class VllmInternalWorkerExtension:
                                     f"axis={axis} subslice={src.source_subslice}"
                                 )
                             dest.copy_(slice_src, non_blocking=True)
+
                         return _pull
+
                     assembled = assemble_into_destination(
-                        plan, pull=_pull_factory(), device=self.device,
+                        plan,
+                        pull=_pull_factory(),
+                        device=self.device,
                     )
                 for hf_name, hf_tensor in translate_megatron_to_hf(
-                    plan, assembled,
+                    plan,
+                    assembled,
                     transformer_config=ctx.transformer_config,
                     hf_names=list(rs.hf_names),
                 ):
@@ -1106,22 +1500,47 @@ class VllmInternalWorkerExtension:
             print("[mx-megatron] cycle yielded 0 tensors; refit aborted")
             return False
 
+        load_start = time.perf_counter()
         self._load_weights(weights)
+        load_s = time.perf_counter() - load_start
+        sync_start = time.perf_counter()
         torch.cuda.current_stream().synchronize()
+        sync_s = time.perf_counter() - sync_start
+        fp8_start = time.perf_counter()
         self._maybe_process_fp8_kv_cache()
+        fp8_s = time.perf_counter() - fp8_start
 
+        publish_self_s = 0.0
         if mx_config.tree_scale_out:
+            publish_self_start = time.perf_counter()
             self._mx_receiver.publish_self_as_source(
                 version=int(version),
                 model_name=self.model_config.model
                 if hasattr(self.model_config, "model")
                 else getattr(
-                    self.model_runner.vllm_config.model_config, "model", "unknown",
+                    self.model_runner.vllm_config.model_config,
+                    "model",
+                    "unknown",
                 ),
             )
+            publish_self_s = time.perf_counter() - publish_self_start
 
+        gc_start = time.perf_counter()
         gc.collect()
         torch.cuda.empty_cache()
+        gc_s = time.perf_counter() - gc_start
+        mem_end = torch.cuda.memory_allocated(self.device)
+        print(
+            "[weight-sync-debug][mx-vllm] "
+            f"rank={worker_rank} version={version} "
+            f"load_s={load_s:.3f} cuda_sync_s={sync_s:.3f} "
+            f"fp8_s={fp8_s:.3f} publish_self_s={publish_self_s:.3f} "
+            f"gc_empty_cache_s={gc_s:.3f} "
+            f"cuda_mem_delta_gb={(mem_end - mem_start) / 1e9:.3f} "
+            f"total_s={time.perf_counter() - total_start:.3f}",
+            flush=True,
+        )
+        self._mx_loaded_version = int(version)
         return True
 
     @wrap_with_nvtx_name(
@@ -1135,17 +1554,31 @@ class VllmInternalWorkerExtension:
         )
 
         load_model_weight_func = self._load_weights
+        total_start = time.perf_counter()
+        mem_start = torch.cuda.memory_allocated(self.device)
 
         try:
+            collective_start = time.perf_counter()
             packed_broadcast_consumer(
                 iterator=iter(self.state_dict_info.items()),
                 group=self.model_update_group,
                 src=0,
                 post_unpack_func=load_model_weight_func,
             )
+            collective_s = time.perf_counter() - collective_start
 
             # Process weights after loading for FP8 KV cache
+            fp8_start = time.perf_counter()
             self._maybe_process_fp8_kv_cache()
+            fp8_s = time.perf_counter() - fp8_start
+            print(
+                "[weight-sync-debug][nccl-vllm] "
+                f"collective_and_load_s={collective_s:.3f} fp8_s={fp8_s:.3f} "
+                f"cuda_mem_delta_gb="
+                f"{(torch.cuda.memory_allocated(self.device) - mem_start) / 1e9:.3f} "
+                f"total_s={time.perf_counter() - total_start:.3f}",
+                flush=True,
+            )
 
         except Exception as e:
             print(

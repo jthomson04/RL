@@ -14,6 +14,7 @@
 import gc
 import os
 import re
+import time
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -1184,12 +1185,22 @@ class MegatronPolicyWorkerImpl(
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> None:
         """Broadcast the weights for collective communication."""
+        start = time.perf_counter()
+        print(
+            f"[weight-sync-debug][nccl-producer] rank={self.rank} start",
+            flush=True,
+        )
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
             iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
             group=self.model_update_group,
             src=0,
             post_iter_func=lambda x: x[1],
+        )
+        print(
+            f"[weight-sync-debug][nccl-producer] rank={self.rank} "
+            f"total_s={time.perf_counter() - start:.3f}",
+            flush=True,
         )
 
     @torch.no_grad()
@@ -1200,7 +1211,7 @@ class MegatronPolicyWorkerImpl(
         version: int,
         mx_config: Any,
         kv_scales: Optional[dict[str, float]] = None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         """Publish per-rank Megatron-native shards to ModelExpress (v2 path).
 
         Megatron analogue of :meth:`DTensorPolicyWorkerImpl.stream_weights_via_mx`,
@@ -1232,18 +1243,22 @@ class MegatronPolicyWorkerImpl(
             publish_eagle_draft_weights,
         )
 
+        total_start = time.perf_counter()
+        mem_start = torch.cuda.memory_allocated()
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         ep_size = parallel_state.get_expert_model_parallel_world_size()
         ep_rank = parallel_state.get_expert_model_parallel_rank()
+        mx_worker_rank = tp_rank
 
         # ---- Lazy-init the publisher (once per worker lifetime). ----
         if not hasattr(self, "_mx_publisher") or self._mx_publisher is None:
+            lazy_start = time.perf_counter()
             mx_device_id = torch.cuda.current_device()
             self._mx_publisher = build_v2_publisher(
-                rank=self.rank,
+                rank=mx_worker_rank,
                 device_id=mx_device_id,
                 fsdp_world_size=self.dp_size,
                 tp_world_size=tp_size,
@@ -1270,13 +1285,28 @@ class MegatronPolicyWorkerImpl(
             # Both are derived once via a Bridge introspection pass (no
             # weights actually transferred), then attached to the
             # publisher so every publish() embeds them in the sidecar.
+            sidecar_start = time.perf_counter()
             self._mx_megatron_sidecar = self._build_megatron_sidecar()
+            sidecar_s = time.perf_counter() - sidecar_start
             try:
                 self._mx_publisher.set_megatron_sidecar(self._mx_megatron_sidecar)
             except AttributeError:
                 # Older modelexpress without the sidecar setter — stash for
                 # the alternate path that injects via add_tensor metadata.
                 pass
+            print(
+                "[weight-sync-debug][mx-trainer] "
+                f"rank={self.rank} version={version} lazy_init_s="
+                f"{time.perf_counter() - lazy_start:.3f} "
+                f"mx_worker_rank={mx_worker_rank} tp_rank={tp_rank} "
+                f"tp_size={tp_size} "
+                f"sidecar_s={sidecar_s:.3f} "
+                f"UCX_NET_DEVICES={os.environ.get('UCX_NET_DEVICES', '')} "
+                f"UCX_MAX_RMA_RAILS={os.environ.get('UCX_MAX_RMA_RAILS', '')} "
+                f"MX_RDMA_NIC_PIN={os.environ.get('MX_RDMA_NIC_PIN', '')} "
+                f"sidecar_keys={sorted(self._mx_megatron_sidecar.keys())}",
+                flush=True,
+            )
 
         # ---- Resolve attention head metadata for qkv_column descriptors. ----
         # Megatron-Core's transformer_config carries this; for non-mainline
@@ -1320,6 +1350,8 @@ class MegatronPolicyWorkerImpl(
             ep_rank=ep_rank,
         )
 
+        add_start = time.perf_counter()
+        core_tensor_count = 0
         for name, local, spec, extras in collect_megatron_publish_set(
             self.model,
             tp_size=tp_size,
@@ -1351,7 +1383,9 @@ class MegatronPolicyWorkerImpl(
                 megatron_role=spec.role,
                 megatron_extras=spec.descriptor_extras,
             )
+            core_tensor_count += 1
 
+        kv_tensor_count = 0
         if kv_scales and (tp_rank == 0 or publish_kv_scales_on_all_ranks):
             for name, scale_value in sorted(kv_scales.items()):
                 scale_tensor = torch.tensor(
@@ -1368,6 +1402,7 @@ class MegatronPolicyWorkerImpl(
                     megatron_role=ROLE_REPLICATED,
                     megatron_extras={"fp8_kv_scale": "1"},
                 )
+                kv_tensor_count += 1
 
         draft_count = publish_eagle_draft_weights(
             publisher=self._mx_publisher,
@@ -1380,9 +1415,145 @@ class MegatronPolicyWorkerImpl(
                 flush=True,
             )
 
+        registered_tensors = getattr(self._mx_publisher, "_registered_tensors", {})
+        publish_tensor_count = len(registered_tensors)
+        publish_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in registered_tensors.values()
+        )
+        add_s = time.perf_counter() - add_start
+        print(
+            "[weight-sync-debug][mx-trainer] "
+            f"rank={self.rank} version={version} "
+            f"collect_add_s={add_s:.3f} core_tensors={core_tensor_count} "
+            f"kv_tensors={kv_tensor_count} draft_tensors={draft_count} "
+            f"published_tensors={publish_tensor_count} "
+            f"published_gb={publish_bytes / 1e9:.3f}",
+            flush=True,
+        )
+
         # ---- Publish + mark ready. ----
-        self._mx_publisher.publish(version=int(version))
+        publish_detail_times: dict[str, float] = {}
+        publish_detail_counts: dict[str, int] = {}
+        publish_detail_restores: list[tuple[Any, str, Any]] = []
+
+        def _wrap_timed_method(obj: Any, method_name: str, key: str) -> None:
+            if obj is None:
+                return
+            original = getattr(obj, method_name, None)
+            if original is None:
+                return
+
+            def timed_method(*args: Any, **kwargs: Any) -> Any:
+                start = time.perf_counter()
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    publish_detail_times[key] = publish_detail_times.get(
+                        key, 0.0
+                    ) + (time.perf_counter() - start)
+                    publish_detail_counts[key] = publish_detail_counts.get(key, 0) + 1
+
+            try:
+                setattr(obj, method_name, timed_method)
+            except Exception:  # noqa: BLE001
+                return
+            publish_detail_restores.append((obj, method_name, original))
+
+        inner_publisher = getattr(self._mx_publisher, "_publisher", None)
+        inner_nixl = getattr(inner_publisher, "_nixl", None)
+        inner_client = getattr(inner_publisher, "_client", None)
+        _wrap_timed_method(inner_nixl, "deregister", "deregister")
+        _wrap_timed_method(inner_nixl, "register_tensors", "register_tensors")
+        _wrap_timed_method(inner_nixl, "get_agent_metadata", "get_agent_metadata")
+        _wrap_timed_method(inner_client, "publish_metadata", "publish_metadata")
+        _wrap_timed_method(inner_publisher, "_build_identity", "build_identity")
+        _wrap_timed_method(
+            inner_publisher,
+            "_build_tensor_protos",
+            "build_tensor_protos",
+        )
+
+        publish_start = time.perf_counter()
+        try:
+            mx_source_id = self._mx_publisher.publish(version=int(version))
+        finally:
+            for obj, method_name, original in publish_detail_restores:
+                setattr(obj, method_name, original)
+        publish_s = time.perf_counter() - publish_start
+        publish_detail = " ".join(
+            f"{key}_s={publish_detail_times.get(key, 0.0):.6f} "
+            f"{key}_count={publish_detail_counts.get(key, 0)}"
+            for key in (
+                "deregister",
+                "register_tensors",
+                "get_agent_metadata",
+                "publish_metadata",
+                "build_identity",
+                "build_tensor_protos",
+            )
+        )
+        print(
+            "[weight-sync-debug][mx-trainer-publish-detail] "
+            f"rank={self.rank} version={version} {publish_detail}",
+            flush=True,
+        )
+        mark_ready_start = time.perf_counter()
         self._mx_publisher.mark_ready()
+        mark_ready_s = time.perf_counter() - mark_ready_start
+        source_candidate: dict[str, Any] | None = None
+        try:
+            from modelexpress.shape_descriptors import encode_registry
+
+            from nemo_rl.distributed.mx_source_plan import (
+                make_source_candidate_from_v2_publisher,
+            )
+
+            registry_extras: dict[str, Any] = {}
+            sidecar = getattr(self._mx_publisher, "_megatron_sidecar", {}) or {}
+            for key in ("megatron_transformer_config", "megatron_hf_name_map"):
+                if key in sidecar:
+                    registry_extras[key] = sidecar[key]
+            registry_blob = encode_registry(
+                getattr(self._mx_publisher, "_registry", []),
+                version=int(version),
+                trainer_world_layout=self._mx_publisher._world_layout.encode(),
+                extras=registry_extras or None,
+            )
+            source_candidate = make_source_candidate_from_v2_publisher(
+                self._mx_publisher,
+                model_name=self.cfg["model_name"],
+                training_step=int(version),
+                role="trainer",
+                registry_blob=registry_blob,
+                megatron_meta={
+                    "tp_rank": int(tp_rank),
+                    "tp_size": int(tp_size),
+                    "pp_rank": int(pp_rank),
+                    "pp_size": int(pp_size),
+                    "ep_rank": int(ep_rank),
+                    "ep_size": int(ep_size),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                "[weight-sync-debug][mx-trainer] "
+                f"rank={self.rank} version={version} "
+                f"source_candidate_error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+        print(
+            "[weight-sync-debug][mx-trainer] "
+            f"rank={self.rank} version={version} publish_s={publish_s:.3f} "
+            f"mark_ready_s={mark_ready_s:.3f} "
+            f"mx_source_id={mx_source_id} "
+            f"worker_id={getattr(self._mx_publisher, 'worker_id', 'none')} "
+            f"source_candidate={source_candidate is not None} "
+            f"cuda_mem_delta_gb={(torch.cuda.memory_allocated() - mem_start) / 1e9:.3f} "
+            f"total_s={time.perf_counter() - total_start:.3f}",
+            flush=True,
+        )
+        return source_candidate
 
     def _mx_megatron_role_overrides_from_sidecar(self, *, role: str) -> dict[str, str]:
         """Derive publish role overrides from Bridge's Megatron-to-HF name map."""
