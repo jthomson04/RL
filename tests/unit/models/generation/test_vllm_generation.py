@@ -34,7 +34,9 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
-from nemo_rl.models.generation.vllm.vllm_worker_async import VllmAsyncGenerationWorkerImpl
+from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    VllmAsyncGenerationWorkerImpl,
+)
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.prefix_reuse import replace_prefix_tokens
@@ -1537,7 +1539,7 @@ def test_replace_prefix_tokens_empty_model_prefix_returns_template():
     assert result == template_token_ids
 
 
-def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
+def test_replace_prefix_tokens_uses_eos_after_template_prefix():
     class _T:
         eos_token_id = 2
 
@@ -1548,13 +1550,14 @@ def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
     model_prefix_token_ids = [7, 2]
     template_prefix_token_ids = [9, 9, 9]  # no EOS inside prefix
     template_token_ids = [9, 9, 9, 2, 10]
-    with pytest.raises(AssertionError):
-        replace_prefix_tokens(
-            tokenizer=tokenizer,
-            model_prefix_token_ids=model_prefix_token_ids,
-            template_prefix_token_ids=template_prefix_token_ids,
-            template_token_ids=template_token_ids,
-        )
+    result = replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+
+    assert result == [7, 2, 10]
 
 
 def test_replace_prefix_tokens_tokenizer_without_eos_raises():
@@ -1571,13 +1574,13 @@ def test_replace_prefix_tokens_tokenizer_without_eos_raises():
         )
 
 
-def test_replace_prefix_tokens_uses_last_eos_in_template_prefix():
+def test_replace_prefix_tokens_ignores_later_eos_after_matching_prefix():
     class _T:
         eos_token_id = 2
 
     tokenizer = _T()
     model_prefix_token_ids = [100, 2]
-    template_prefix_token_ids = [9, 2, 9, 2]  # two EOS; last at idx=3
+    template_prefix_token_ids = [9, 2]
     template_token_ids = [9, 2, 9, 2, 77, 88]
     result = replace_prefix_tokens(
         tokenizer=tokenizer,
@@ -1585,7 +1588,7 @@ def test_replace_prefix_tokens_uses_last_eos_in_template_prefix():
         template_prefix_token_ids=template_prefix_token_ids,
         template_token_ids=template_token_ids,
     )
-    assert result == [100, 2, 77, 88]
+    assert result == [100, 2, 9, 2, 77, 88]
 
 
 @pytest.mark.asyncio

@@ -146,6 +146,33 @@ def test_prepare_dynamo_chat_completion_request_preserves_prior_prefix() -> None
     assert tokenizer.calls[1]["add_generation_prompt"] is False
 
 
+def test_prepare_dynamo_chat_completion_request_splices_from_tokenized_message() -> (
+    None
+):
+    tokenizer = _Tokenizer()
+    body = {
+        "model": "dummy-model",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "first",
+                "prompt_token_ids": [10],
+                "generation_token_ids": [31, 32, 2],
+                "generation_log_probs": [-0.1, -0.2, -0.3],
+            },
+            {"role": "tool", "content": "result", "tool_call_id": "call-1"},
+            {"role": "assistant", "content": "prefill"},
+        ],
+    }
+
+    prepared = prepare_dynamo_chat_completion_request(body, tokenizer=tokenizer)
+
+    assert prepared["nvext"]["token_data"] == [10, 31, 32, 2, 900, 900, 99]
+    assert "prompt_token_ids" not in prepared["messages"][1]
+    assert "generation_token_ids" not in prepared["messages"][1]
+
+
 def test_prepare_dynamo_chat_completion_request_rejects_stream() -> None:
     with pytest.raises(ValueError, match="stream=True"):
         prepare_dynamo_chat_completion_request(

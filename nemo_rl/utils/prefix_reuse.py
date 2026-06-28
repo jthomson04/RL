@@ -71,23 +71,24 @@ def replace_prefix_tokens(
     if model_prefix_token_ids[-1] == eos_token_id:
         model_cut_end -= 1
 
-    assert len(template_token_ids) > len(
-        template_prefix_token_ids
-    ), f"""Found possibly non-monotonically increasing trajectory!
-Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
-
-Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
-
-Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
-
-Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
-"""
+    common_prefix_length = 0
+    for prefix_token_id, token_id in zip(template_prefix_token_ids, template_token_ids):
+        if prefix_token_id != token_id:
+            break
+        common_prefix_length += 1
 
     template_cut_start = -1
-    for pos in reversed(range(len(template_prefix_token_ids))):
-        if template_token_ids[pos] == eos_token_id:
-            template_cut_start = pos
-            break
+    if common_prefix_length == len(template_prefix_token_ids):
+        for pos in reversed(range(common_prefix_length)):
+            if template_token_ids[pos] == eos_token_id:
+                template_cut_start = pos
+                break
+
+    if template_cut_start < 0:
+        for pos in range(common_prefix_length, len(template_token_ids)):
+            if template_token_ids[pos] == eos_token_id:
+                template_cut_start = pos
+                break
 
     assert (
         template_cut_start >= 0

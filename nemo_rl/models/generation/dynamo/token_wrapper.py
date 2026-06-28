@@ -23,7 +23,6 @@ from typing import Any, Optional
 from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
 from nemo_rl.utils.prefix_reuse import (
     derive_required_prefix_token_ids,
-    messages_to_last_assistant,
     replace_prefix_tokens,
 )
 
@@ -50,6 +49,19 @@ def _strip_gym_token_metadata(messages: list[Any]) -> list[Any]:
             for field in _GYM_TOKEN_METADATA_FIELDS:
                 message.pop(field, None)
     return stripped_messages
+
+
+def _latest_token_metadata_prefix_length(messages: list[Any]) -> Optional[int]:
+    for index in reversed(range(len(messages))):
+        message = messages[index]
+        if not isinstance(message, dict):
+            continue
+        if (
+            message.get("prompt_token_ids") is not None
+            and message.get("generation_token_ids") is not None
+        ):
+            return index + 1
+    return None
 
 
 def _chat_template_kwargs(
@@ -167,10 +179,16 @@ def prepare_dynamo_chat_completion_request(
 
     required_prefix_token_ids = derive_required_prefix_token_ids(messages)
     if required_prefix_token_ids is not None:
+        prefix_length = _latest_token_metadata_prefix_length(messages)
+        if prefix_length is None:
+            raise ValueError(
+                "Dynamo token wrapper found prefix token IDs but could not "
+                "locate the message carrying token metadata."
+            )
         prefix_prompt_token_ids = _render_prompt_token_ids(
             tokenizer=tokenizer,
             request_body=prepared_body,
-            messages=messages_to_last_assistant(stripped_messages),
+            messages=stripped_messages[:prefix_length],
             tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
             add_generation_prompt=False,
         )

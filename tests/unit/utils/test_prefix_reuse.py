@@ -14,6 +14,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from nemo_rl.utils.prefix_reuse import (
     derive_required_prefix_token_ids,
     messages_to_last_assistant,
@@ -37,6 +39,49 @@ def test_replace_prefix_tokens_preserves_prior_model_tokens() -> None:
     )
 
     assert result == [11, 12, 220, 17, 2, 21, 22]
+
+
+def test_replace_prefix_tokens_supports_shorter_full_template() -> None:
+    result = replace_prefix_tokens(
+        _Tokenizer(),
+        model_prefix_token_ids=[11, 12, 220, 17, 2],
+        template_prefix_token_ids=[9, 2, 11, 12, 1001, 1002, 1003, 2],
+        template_token_ids=[9, 2, 11, 12, 2, 21, 22],
+    )
+
+    assert result == [11, 12, 220, 17, 2, 21, 22]
+
+
+def test_replace_prefix_tokens_ignores_later_eos_after_matching_prefix() -> None:
+    result = replace_prefix_tokens(
+        _Tokenizer(),
+        model_prefix_token_ids=[100, 2],
+        template_prefix_token_ids=[9, 2],
+        template_token_ids=[9, 2, 9, 2, 77, 88],
+    )
+
+    assert result == [100, 2, 9, 2, 77, 88]
+
+
+def test_replace_prefix_tokens_finds_eos_after_old_prefix_bound() -> None:
+    result = replace_prefix_tokens(
+        _Tokenizer(),
+        model_prefix_token_ids=[11, 12, 220, 17, 2],
+        template_prefix_token_ids=[11, 12],
+        template_token_ids=[11, 12, 1001, 2, 21, 22],
+    )
+
+    assert result == [11, 12, 220, 17, 2, 21, 22]
+
+
+def test_replace_prefix_tokens_missing_eos_in_full_template_raises() -> None:
+    with pytest.raises(AssertionError, match="No EOS token ID found"):
+        replace_prefix_tokens(
+            _Tokenizer(),
+            model_prefix_token_ids=[11, 12, 220, 17, 2],
+            template_prefix_token_ids=[11, 12, 1001],
+            template_token_ids=[11, 12, 1001, 21, 22],
+        )
 
 
 def test_derive_required_prefix_token_ids_uses_latest_message() -> None:
