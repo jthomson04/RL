@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import os
 import time
 import traceback
 from typing import Any
@@ -796,6 +797,25 @@ class VllmInternalWorkerExtension:
         # already returns the right slice info; the gap is just the NIXL
         # plumbing for partial-buffer registers.
         ctx = self._mx_megatron_ctx
+        # MX_MEGATRON_BUFFER_LOC controls where the persistent NIXL-registered
+        # cache lives. Default "device" keeps the pre-Phase-0.5 behavior
+        # (buffers on self.device, i.e. HBM). "host" enables pinned-CPU
+        # staging: buffers allocated with pin_memory=True, NIXL registers
+        # them as DRAM, RDMA writes into pinned host, then vLLM's
+        # _load_weights → param.copy_(non_blocking=True) triggers async
+        # H2D copies overlapping with subsequent buffer processing.
+        # See NIXL_transfer._resolve_local_mem_type for the memtype dispatch.
+        _buffer_loc = os.environ.get("MX_MEGATRON_BUFFER_LOC", "device").lower()
+        _alloc_kwargs: dict[str, Any]
+        if _buffer_loc == "host":
+            _alloc_kwargs = {"pin_memory": True}
+        elif _buffer_loc == "device":
+            _alloc_kwargs = {"device": self.device}
+        else:
+            raise ValueError(
+                f"MX_MEGATRON_BUFFER_LOC={_buffer_loc!r} not recognized; "
+                f"expected 'device' or 'host'"
+            )
         if not hasattr(self, "_mx_megatron_buffers"):
             buffers: dict[str, "torch.Tensor"] = {}
             vocab_buffers: dict[str, "torch.Tensor"] = {}
@@ -827,7 +847,7 @@ class VllmInternalWorkerExtension:
                 # shape. Vocab tensors are the exception: vLLM's loader wants
                 # the full vocab tensor and slices it internally for TP.
                 target[spec.megatron_name] = torch.empty(
-                    full_shape, dtype=dt, device=self.device,
+                    full_shape, dtype=dt, **_alloc_kwargs,
                 )
             # Register all at once with the receiver's NIXL plane.
             all_buffers = dict(buffers)
@@ -839,7 +859,8 @@ class VllmInternalWorkerExtension:
                 f"[mx-megatron] pre-allocated + registered "
                 f"{len(buffers)} per-rank Megatron buffers and "
                 f"{len(vocab_buffers)} full-vocab buffers "
-                f"({sum(b.numel() * b.element_size() for b in all_buffers.values()) / 1e9:.2f} GB)"
+                f"({sum(b.numel() * b.element_size() for b in all_buffers.values()) / 1e9:.2f} GB, "
+                f"loc={_buffer_loc})"
             )
 
         # Choose between matched-TP fast path and mixed-TP per-source path.
@@ -988,7 +1009,13 @@ class VllmInternalWorkerExtension:
                 if plan.tensor_name in plan_dests:
                     dest = plan_dests[plan.tensor_name]
                 else:
-                    dest = torch.empty(plan.target_shape, dtype=dt, device=self.device)
+                    # Honor MX_MEGATRON_BUFFER_LOC for the mixed-TP cache
+                    # as well. Same rationale as the matched-TP allocation
+                    # above: "host" places pinned CPU buffers, "device"
+                    # keeps HBM.
+                    dest = torch.empty(
+                        plan.target_shape, dtype=dt, **_alloc_kwargs,
+                    )
                     plan_dests[plan.tensor_name] = dest
                     newly_allocated_this_cycle += 1
                 axis = 1 if plan.assembly == "concat_dim1" else 0
@@ -1039,7 +1066,13 @@ class VllmInternalWorkerExtension:
                     f"(cached for subsequent refit cycles)"
                 )
             elif plan_dests:
-                # Cycle 2+: dest buffers already registered.
+                # Cycle 2+: dest buffers already registered. Rebind so
+                # subsequent transfers resolve against these cached
+                # buffers (in case a v0 scratch call between cycles
+                # swapped self._tensors) and so _local_mem_type stays
+                # consistent with the buffers' actual device (matters
+                # for DRAM/CUDA dispatch in prep_xfer_dlist).
+                self._mx_receiver._receiver._nixl.rebind_tensors(plan_dests)
                 print(
                     f"[mx-megatron] reusing {len(plan_dests)} cached v1 dest buffers"
                 )
