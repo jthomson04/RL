@@ -33,6 +33,9 @@ if ! "${VLLM_VENV}/bin/python" -c \
   if [[ -s "${PINNED_REQUIREMENTS}" ]]; then
     UV_CACHE_DIR="${UV_CACHE_DIR}" \
       uv pip sync --python "${VLLM_VENV}/bin/python" "${PINNED_REQUIREMENTS}"
+    UV_CACHE_DIR="${UV_CACHE_DIR}" \
+      uv pip install --python "${VLLM_VENV}/bin/python" --no-deps \
+      --editable "${REPO_ROOT}"
   else
     echo "Bootstrapping vLLM 0.23 before the first environment freeze." >&2
     UV_CACHE_DIR="${UV_CACHE_DIR}" \
