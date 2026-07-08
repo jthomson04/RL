@@ -40,9 +40,12 @@ reasoning_plugin = Path(
     "nano_v3_reasoning_parser.py"
 ).resolve()
 import_from_path("nano_v3_reasoning_parser_preflight", reasoning_plugin)
+ReasoningParserManager.get_reasoning_parser("nano_v3")
 assert "nano_v3" in ReasoningParserManager.reasoning_parsers
 ReasoningParserManager.reasoning_parsers.pop("nano_v3")
+ReasoningParserManager.lazy_parsers.pop("nano_v3", None)
 ReasoningParserManager.import_reasoning_parser(str(reasoning_plugin))
+ReasoningParserManager.get_reasoning_parser("nano_v3")
 
 ToolParserManager.get_tool_parser("qwen3_coder")
 assert "qwen3_coder" in ToolParserManager.tool_parsers
