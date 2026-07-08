@@ -6,7 +6,7 @@ set -euo pipefail
 REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 ROOT=${ROOT:-/lustre/fsw/portfolios/coreai/users/jothomson/nemo-rl-dynamo-slurm-swe}
 PERSISTENT_CACHE=${PERSISTENT_CACHE:-${ROOT}/cache/nemotron_nano_v3_5_vllm020}
-NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR:-${PERSISTENT_CACHE}/venvs}
+NEMO_RL_VENV_DIR=${VLLM_COMPARISON_VENV_DIR:-${PERSISTENT_CACHE}/venvs}
 VLLM_ACTOR=nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker
 VLLM_VENV=${NEMO_RL_VENV_DIR}/${VLLM_ACTOR}
 UV_CACHE_DIR=${UV_CACHE_DIR:-${PERSISTENT_CACHE}/uv}
@@ -35,6 +35,7 @@ reasoning_plugin = Path(
 )
 ReasoningParserManager.import_reasoning_parser(str(reasoning_plugin))
 
+ToolParserManager.get_tool_parser("qwen3_coder")
 assert "qwen3_coder" in ToolParserManager.tool_parsers
 assert "nano_v3" in ReasoningParserManager.reasoning_parsers
 
