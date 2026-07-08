@@ -13,6 +13,8 @@
 # limitations under the License.
 
 from nemo_rl.distributed.ray_actor_environment_registry import (
+    ACTOR_ENVIRONMENT_REGISTRY,
+    VLLM_EXECUTABLE,
     _resolve_vllm_executable,
 )
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
@@ -31,3 +33,17 @@ def test_vllm_executable_override_takes_precedence(monkeypatch) -> None:
 
     assert _resolve_vllm_executable(True) == override
     assert _resolve_vllm_executable(False) == override
+
+
+def test_complete_vllm_actor_family_uses_one_environment() -> None:
+    actor_fqns = (
+        "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker",
+        "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker",
+        "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
+        "nemo_rl.algorithms.async_utils.ReplayBuffer",
+        "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor",
+    )
+
+    assert {
+        ACTOR_ENVIRONMENT_REGISTRY[actor_fqn] for actor_fqn in actor_fqns
+    } == {VLLM_EXECUTABLE}

@@ -68,6 +68,8 @@ NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR:-${PERSISTENT_CACHE}/venvs}
 VLLM_ACTOR=nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker
 VLLM_VENV=${NEMO_RL_VENV_DIR}/${VLLM_ACTOR}
 NEMO_RL_VLLM_PY_EXECUTABLE=${NEMO_RL_VLLM_PY_EXECUTABLE:-${VLLM_VENV}/bin/python}
+VLLM_ACTOR_MANIFEST_DIR=${VLLM_ACTOR_MANIFEST_DIR:-${PERSISTENT_CACHE}/manifests}
+VLLM_ACTOR_FREEZE=${VLLM_ACTOR_MANIFEST_DIR}/vllm023-actor-freeze.txt
 WANDB_STAGE_ROOT=${WANDB_STAGE_ROOT:-${ROOT}/cache/wandb}
 NEMO_GYM_VENV_DIR=${NEMO_GYM_VENV_DIR:-/opt/gym_venvs}
 NEMO_GYM_UV_CACHE=${NEMO_GYM_UV_CACHE:-/tmp/nemo_gym_uv_cache}
@@ -132,6 +134,9 @@ if [[ "${DRY_RUN:-0}" != "1" ]]; then
   require_path "${CONTAINER}" "combined comparison image"
   require_path "${VLLM_VENV}/.dynamo-vllm-stack" \
     "validated regular-vLLM 0.23 actor environment"
+  require_path "${VLLM_ACTOR_FREEZE}" "regular-vLLM actor freeze"
+  require_path "${VLLM_ACTOR_FREEZE}.sha256" \
+    "regular-vLLM actor freeze checksum"
 fi
 for sif_subdir in swerebench nv_internal r2e_gym swegym swebench mercor/swebenchpro_ots; do
   require_path "${SIF_DIR}/${sif_subdir}" "SIF directory ${sif_subdir}"
@@ -155,6 +160,7 @@ cat > "${RUN_LOG_DIR}/git-revision.txt" <<EOF
 superproject: $(git -C "${REPO_ROOT}" rev-parse HEAD)
 gym:          ${GYM_COMMIT}
 generation:   NeMo-RL vLLM backend (vLLM 0.23.0 with Dynamo-matched refit backport)
+actor freeze: $(sha256sum "${VLLM_ACTOR_FREEZE}" | awk '{print $1}')
 EOF
 
 SIF_FORMATTERS="[\"${SIF_DIR}/swerebench/{instance_id}.sif\",\"${SIF_DIR}/nv_internal/{instance_id}.sif\",\"${SIF_DIR}/r2e_gym/{instance_id}.sif\",\"${SIF_DIR}/swegym/sweb.eval.arm64.{instance_id}.sif\",\"${SIF_DIR}/swebench/swe-bench.eval.arm64.{instance_id}.sif\",\"${SIF_DIR}/mercor/swebenchpro_ots/{instance_id}.sif\"]"
