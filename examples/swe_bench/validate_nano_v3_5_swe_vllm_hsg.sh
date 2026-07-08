@@ -4,11 +4,19 @@
 set -euo pipefail
 
 REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
-PYTHON=${PYTHON:-/opt/nemo_rl_venv/bin/python}
+ROOT=${ROOT:-/lustre/fsw/portfolios/coreai/users/jothomson/nemo-rl-dynamo-slurm-swe}
+PERSISTENT_CACHE=${PERSISTENT_CACHE:-${ROOT}/cache/nemotron_nano_v3_5_vllm020}
+NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR:-${PERSISTENT_CACHE}/venvs}
+VLLM_ACTOR=nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker
+VLLM_VENV=${NEMO_RL_VENV_DIR}/${VLLM_ACTOR}
+UV_CACHE_DIR=${UV_CACHE_DIR:-${PERSISTENT_CACHE}/uv}
 
 cd "${REPO_ROOT}"
+mkdir -p "${NEMO_RL_VENV_DIR}" "${UV_CACHE_DIR}"
 
-"${PYTHON}" - <<'PY'
+UV_PROJECT_ENVIRONMENT="${VLLM_VENV}" \
+UV_CACHE_DIR="${UV_CACHE_DIR}" \
+  uv run --locked --extra vllm --directory "${REPO_ROOT}" python - <<'PY'
 import importlib.metadata as metadata
 import inspect
 from pathlib import Path
@@ -49,7 +57,17 @@ print("reasoning parser nano_v3: registered")
 print("regular-vLLM SWE configuration: validated")
 PY
 
-"${PYTHON}" -m pytest \
+"${VLLM_VENV}/bin/python" -m pytest \
+  tests/unit/distributed/test_ray_actor_environment_registry.py \
   tests/unit/models/generation/test_swe_backend_comparison_config.py \
   tests/unit/models/generation/test_vllm_generation.py \
   -q
+
+/opt/nemo_rl_venv/bin/python -m ruff check \
+  nemo_rl/distributed/ray_actor_environment_registry.py \
+  tests/unit/distributed/test_ray_actor_environment_registry.py \
+  tests/unit/models/generation/test_swe_backend_comparison_config.py
+/opt/nemo_rl_venv/bin/python -m ruff format --check \
+  nemo_rl/distributed/ray_actor_environment_registry.py \
+  tests/unit/distributed/test_ray_actor_environment_registry.py \
+  tests/unit/models/generation/test_swe_backend_comparison_config.py

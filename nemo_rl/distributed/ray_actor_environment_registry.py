@@ -16,10 +16,18 @@ import os
 
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 
+
+def _resolve_vllm_executable(use_system_executable: bool) -> str:
+    override = os.environ.get("NEMO_RL_VLLM_PY_EXECUTABLE")
+    if override:
+        return override
+    return PY_EXECUTABLES.SYSTEM if use_system_executable else PY_EXECUTABLES.VLLM
+
+
 USE_SYSTEM_EXECUTABLE = os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1"
-VLLM_EXECUTABLE = (
-    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.VLLM
-)
+# A combined image may materialize training dependencies in the system
+# interpreter while keeping native vLLM in its locked, backend-specific venv.
+VLLM_EXECUTABLE = _resolve_vllm_executable(USE_SYSTEM_EXECUTABLE)
 SGLANG_EXECUTABLE = (
     PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.SGLANG
 )

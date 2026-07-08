@@ -64,6 +64,8 @@ NEMO_LOG_DIR=${NEMO_LOG_DIR:-${RUN_LOG_DIR}/nemo}
 HF_HOME=${HF_HOME:-${ROOT}/cache/huggingface}
 HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-${HF_HOME}/datasets}
 PERSISTENT_CACHE=${PERSISTENT_CACHE:-${ROOT}/cache/nemotron_nano_v3_5_vllm020}
+NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR:-${PERSISTENT_CACHE}/venvs}
+NEMO_RL_VLLM_PY_EXECUTABLE=${NEMO_RL_VLLM_PY_EXECUTABLE:-uv run --locked --extra vllm --directory ${REPO_ROOT}}
 WANDB_STAGE_ROOT=${WANDB_STAGE_ROOT:-${ROOT}/cache/wandb}
 NEMO_GYM_VENV_DIR=${NEMO_GYM_VENV_DIR:-/opt/gym_venvs}
 NEMO_GYM_UV_CACHE=${NEMO_GYM_UV_CACHE:-/tmp/nemo_gym_uv_cache}
@@ -141,7 +143,7 @@ fi
 mkdir -p \
   "${RESULTS_DIR}" "${RUN_LOG_DIR}" "${NEMO_LOG_DIR}" \
   "${HF_HOME}" "${HF_DATASETS_CACHE}" \
-  "${PERSISTENT_CACHE}/uv" \
+  "${PERSISTENT_CACHE}/uv" "${NEMO_RL_VENV_DIR}" \
   "${LUSTRE_VLLM_CACHE}" "${LUSTRE_INDUCTOR_CACHE}" "${LUSTRE_TRITON_CACHE}" \
   "${WANDB_STAGE_ROOT}/dir" "${WANDB_STAGE_ROOT}/cache" "${WANDB_STAGE_ROOT}/data"
 
@@ -202,6 +204,7 @@ export RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-60}
 export HF_HOME HF_DATASETS_CACHE
 export NEMO_GYM_VENV_DIR
 export NEMO_RL_PY_EXECUTABLES_SYSTEM=1
+export NEMO_RL_VENV_DIR NEMO_RL_VLLM_PY_EXECUTABLE
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export WANDB_DIR=${WANDB_STAGE_ROOT}/dir
 export WANDB_CACHE_DIR=${WANDB_STAGE_ROOT}/cache
@@ -289,6 +292,7 @@ echo "  batch: PPS=${PPS}, GPP=${GPP}, GBS=${GBS}; max_length=${MAX_LENGTH}"
 echo "  model: ${MODEL_PATH}"
 echo "  source model: ${MODEL_SOURCE_PATH}"
 echo "  image: ${CONTAINER}"
+echo "  vLLM environment: ${NEMO_RL_VENV_DIR} (locked vLLM 0.20.0)"
 echo "  logs:  ${RUN_LOG_DIR}"
 
 SBATCH_ARGS=(
