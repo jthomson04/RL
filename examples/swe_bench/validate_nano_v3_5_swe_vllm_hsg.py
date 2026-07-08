@@ -24,8 +24,10 @@ def main() -> None:
 
     repo_root = Path(os.environ.get("REPO_ROOT", Path.cwd())).resolve()
     assert metadata.version("vllm") == "0.23.0"
-    assert not Path(vllm.__file__).resolve().is_relative_to(
-        Path("/opt/dynamo_venv").resolve()
+    assert (
+        not Path(vllm.__file__)
+        .resolve()
+        .is_relative_to(Path("/opt/dynamo_venv").resolve())
     ), vllm.__file__
     assert Path("/opt/vllm_backports").read_text(encoding="utf-8").strip() == (
         "vllm#44814 45ffb397d1c7803a78c32846807c71d881e11189"
@@ -90,8 +92,7 @@ def main() -> None:
     assert not mismatches, mismatches
 
     reasoning_plugin = (
-        repo_root
-        / "nemo_rl/models/generation/vllm/reasoning_parsers/"
+        repo_root / "nemo_rl/models/generation/vllm/reasoning_parsers/"
         "nano_v3_reasoning_parser.py"
     )
     ReasoningParserManager.reasoning_parsers.pop("nano_v3", None)
@@ -100,9 +101,7 @@ def main() -> None:
     ReasoningParserManager.get_reasoning_parser("nano_v3")
     ToolParserManager.get_tool_parser("qwen3_coder")
 
-    config_path = (
-        repo_root / "examples/swe_bench/grpo_nano_v3_5_swe_vllm_hsg.yaml"
-    )
+    config_path = repo_root / "examples/swe_bench/grpo_nano_v3_5_swe_vllm_hsg.yaml"
     with config_path.open(encoding="utf-8") as config_file:
         generation = yaml.safe_load(config_file)["policy"]["generation"]
     assert generation["backend"] == "vllm"

@@ -44,6 +44,6 @@ def test_complete_vllm_actor_family_uses_one_environment() -> None:
         "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor",
     )
 
-    assert {
-        ACTOR_ENVIRONMENT_REGISTRY[actor_fqn] for actor_fqn in actor_fqns
-    } == {VLLM_EXECUTABLE}
+    assert {ACTOR_ENVIRONMENT_REGISTRY[actor_fqn] for actor_fqn in actor_fqns} == {
+        VLLM_EXECUTABLE
+    }
