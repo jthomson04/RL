@@ -61,7 +61,7 @@ def test_swe_vllm_comparison_only_changes_backend_contract() -> None:
         "async_engine": True,
         "expose_http_server": True,
         "reasoning_parser_plugin": (
-            "nemo_rl/models/generation/vllm/reasoning_parsers/"
+            "${oc.env:REPO_ROOT,.}/nemo_rl/models/generation/vllm/reasoning_parsers/"
             "nano_v3_reasoning_parser.py"
         ),
         "http_server_serving_chat_kwargs": {

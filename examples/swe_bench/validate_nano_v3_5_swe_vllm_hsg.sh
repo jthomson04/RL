@@ -31,13 +31,17 @@ import vllm.tool_parsers  # noqa: F401 - registers built-in parsers
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
 from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
+from vllm.utils.import_utils import import_from_path
 
 assert metadata.version("vllm") == "0.20.0"
 
 reasoning_plugin = Path(
     "nemo_rl/models/generation/vllm/reasoning_parsers/"
     "nano_v3_reasoning_parser.py"
-)
+).resolve()
+import_from_path("nano_v3_reasoning_parser_preflight", reasoning_plugin)
+assert "nano_v3" in ReasoningParserManager.reasoning_parsers
+ReasoningParserManager.reasoning_parsers.pop("nano_v3")
 ReasoningParserManager.import_reasoning_parser(str(reasoning_plugin))
 
 ToolParserManager.get_tool_parser("qwen3_coder")
