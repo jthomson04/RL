@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+#SBATCH --account=coreai_tritoninference_triton3
+#SBATCH --partition=cpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=160G
+#SBATCH --time=02:00:00
+#SBATCH --job-name=nemo-rl-vllm023-swe-validate
+
+set -euo pipefail
+
+ROOT=${ROOT:-/lustre/fsw/portfolios/coreai/users/jothomson/nemo-rl-dynamo-slurm-swe}
+CONTAINER=${CONTAINER:-${ROOT}/images/nemo-rl-dynamo-swe-hsg-vllm023.sqsh}
+
+test -s "${CONTAINER}"
+srun \
+  --container-image="${CONTAINER}" \
+  --container-workdir=/opt/nemo-rl \
+  --no-container-mount-home \
+  /bin/bash examples/swe_bench/validate_nano_v3_5_swe_vllm_hsg_image.sh

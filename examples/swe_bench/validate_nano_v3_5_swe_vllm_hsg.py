@@ -21,7 +21,6 @@ def main() -> None:
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
     from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
-    from vllm.utils.import_utils import import_from_path
 
     repo_root = Path(os.environ.get("REPO_ROOT", Path.cwd())).resolve()
     assert metadata.version("vllm") == "0.23.0"
