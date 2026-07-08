@@ -154,7 +154,7 @@ mkdir -p \
 cat > "${RUN_LOG_DIR}/git-revision.txt" <<EOF
 superproject: $(git -C "${REPO_ROOT}" rev-parse HEAD)
 gym:          ${GYM_COMMIT}
-generation:   NeMo-RL vLLM backend (vLLM 0.23.0 linked from /opt/dynamo_venv)
+generation:   NeMo-RL vLLM backend (vLLM 0.23.0 with Dynamo-matched refit backport)
 EOF
 
 SIF_FORMATTERS="[\"${SIF_DIR}/swerebench/{instance_id}.sif\",\"${SIF_DIR}/nv_internal/{instance_id}.sif\",\"${SIF_DIR}/r2e_gym/{instance_id}.sif\",\"${SIF_DIR}/swegym/sweb.eval.arm64.{instance_id}.sif\",\"${SIF_DIR}/swebench/swe-bench.eval.arm64.{instance_id}.sif\",\"${SIF_DIR}/mercor/swebenchpro_ots/{instance_id}.sif\"]"
@@ -296,7 +296,7 @@ echo "  batch: PPS=${PPS}, GPP=${GPP}, GBS=${GBS}; max_length=${MAX_LENGTH}"
 echo "  model: ${MODEL_PATH}"
 echo "  source model: ${MODEL_SOURCE_PATH}"
 echo "  image: ${CONTAINER}"
-echo "  vLLM environment: ${VLLM_VENV} (vLLM 0.23.0 from /opt/dynamo_venv)"
+echo "  vLLM environment: ${VLLM_VENV} (vLLM 0.23.0, Dynamo-matched backport)"
 echo "  logs:  ${RUN_LOG_DIR}"
 
 SBATCH_ARGS=(

@@ -11,7 +11,7 @@ VLLM_ACTOR=nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationW
 VLLM_VENV=${NEMO_RL_VENV_DIR}/${VLLM_ACTOR}
 UV_CACHE_DIR=${UV_CACHE_DIR:-${PERSISTENT_CACHE}/uv}
 STACK_MARKER=${VLLM_VENV}/.dynamo-vllm-stack
-EXPECTED_STACK_MARKER='vllm=0.23.0 source=/opt/dynamo_venv backport=vllm#44814@45ffb397'
+EXPECTED_STACK_MARKER='vllm=0.23.0 python=3.13 backport=vllm#44814@45ffb397'
 
 cd "${REPO_ROOT}"
 mkdir -p "${NEMO_RL_VENV_DIR}" "${UV_CACHE_DIR}"
@@ -26,36 +26,33 @@ fi
 # Ray requires the actor and driver to use the same Python minor version. The
 # image's NeMo-RL/Ray environment is Python 3.13, whereas /opt/dynamo_venv is
 # Python 3.12. Resolve vLLM 0.23's dependencies into the actor's Python 3.13
-# environment, then link the vLLM distribution itself directly from
-# /opt/dynamo_venv. The published wheel uses the stable ABI, so this gives the
-# regular backend the exact patched package used by Dynamo without mixing Ray
-# Python versions or rebuilding the image.
+# environment, then apply the same NemotronH layerwise-reload backport used in
+# /opt/dynamo_venv. We cannot link Dynamo's entire Python 3.12 distribution:
+# although vLLM's primary extensions use the stable ABI, some optional modules
+# are CPython-minor-specific. The patched refit implementation is compared
+# byte-for-byte below so the behavior relevant to this workload cannot drift.
 if [[ ! -f "${STACK_MARKER}" ]] || \
   [[ "$(<"${STACK_MARKER}")" != "${EXPECTED_STACK_MARKER}" ]]; then
   ACTOR_SITE=$(
     "${VLLM_VENV}/bin/python" -c \
       'import sysconfig; print(sysconfig.get_paths()["purelib"])'
   )
-  if [[ -L "${ACTOR_SITE}/vllm" ]]; then
-    rm "${ACTOR_SITE}/vllm"
-  fi
-  if [[ -L "${ACTOR_SITE}/vllm-0.23.0.dist-info" ]]; then
+  rm -f "${STACK_MARKER}"
+  [[ ! -L "${ACTOR_SITE}/vllm" ]] || rm "${ACTOR_SITE}/vllm"
+  [[ ! -L "${ACTOR_SITE}/vllm-0.23.0.dist-info" ]] || \
     rm "${ACTOR_SITE}/vllm-0.23.0.dist-info"
-  fi
   UV_CACHE_DIR="${UV_CACHE_DIR}" \
     uv pip install --python "${VLLM_VENV}/bin/python" --upgrade 'vllm==0.23.0'
-  uv pip uninstall --python "${VLLM_VENV}/bin/python" vllm
 
-  DYNAMO_SITE=$(
-    /opt/dynamo_venv/bin/python -c \
-      'import pathlib, vllm; print(pathlib.Path(vllm.__file__).resolve().parent.parent)'
+  VLLM_RELOAD_PATCH=${REPO_ROOT}/docker/patches/vllm-0.23.0-layerwise-reload-composed-loader.patch
+  test -f "${VLLM_RELOAD_PATCH}"
+  (
+    cd "${ACTOR_SITE}"
+    if ! git apply --reverse --check "${VLLM_RELOAD_PATCH}"; then
+      git apply --check "${VLLM_RELOAD_PATCH}"
+      git apply "${VLLM_RELOAD_PATCH}"
+    fi
   )
-  test -d "${DYNAMO_SITE}/vllm"
-  test -d "${DYNAMO_SITE}/vllm-0.23.0.dist-info"
-  rm -rf "${ACTOR_SITE}/vllm" "${ACTOR_SITE}/vllm-0.23.0.dist-info"
-  ln -s "${DYNAMO_SITE}/vllm" "${ACTOR_SITE}/vllm"
-  ln -s "${DYNAMO_SITE}/vllm-0.23.0.dist-info" \
-    "${ACTOR_SITE}/vllm-0.23.0.dist-info"
   printf '%s\n' "${EXPECTED_STACK_MARKER}" > "${STACK_MARKER}"
 fi
 
@@ -75,17 +72,24 @@ from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
 from vllm.utils.import_utils import import_from_path
 
 assert metadata.version("vllm") == "0.23.0"
-assert Path(vllm.__file__).resolve().is_relative_to(
+assert not Path(vllm.__file__).resolve().is_relative_to(
     Path("/opt/dynamo_venv").resolve()
 ), vllm.__file__
 assert Path("/opt/vllm_backports").read_text(encoding="utf-8").strip() == (
     "vllm#44814 45ffb397d1c7803a78c32846807c71d881e11189"
 )
-assert not [
-    path
-    for path in Path(vllm.__file__).resolve().parent.rglob("*.so")
-    if "cpython-312" in path.name
-], "the shared vLLM package must contain stable-ABI extensions"
+actor_reload_meta = (
+    Path(vllm.__file__).resolve().parent
+    / "model_executor/model_loader/reload/meta.py"
+)
+dynamo_reload_meta = (
+    Path("/opt/dynamo_venv/lib/python3.12/site-packages/vllm")
+    / "model_executor/model_loader/reload/meta.py"
+)
+assert actor_reload_meta.read_bytes() == dynamo_reload_meta.read_bytes(), (
+    actor_reload_meta,
+    dynamo_reload_meta,
+)
 
 comparison_packages = (
     "vllm",
