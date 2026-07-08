@@ -26,7 +26,7 @@ def test_vllm_executable_defaults_follow_global_system_selection(monkeypatch) ->
 
 
 def test_vllm_executable_override_takes_precedence(monkeypatch) -> None:
-    override = "uv run --locked --extra vllm --directory /opt/nemo-rl"
+    override = "/lustre/cache/vllm023/venvs/vllm-worker/bin/python"
     monkeypatch.setenv("NEMO_RL_VLLM_PY_EXECUTABLE", override)
 
     assert _resolve_vllm_executable(True) == override

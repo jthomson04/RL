@@ -63,17 +63,19 @@ RUN_LOG_DIR=${RUN_LOG_DIR:-${ROOT}/logs/${EXP_NAME}}
 NEMO_LOG_DIR=${NEMO_LOG_DIR:-${RUN_LOG_DIR}/nemo}
 HF_HOME=${HF_HOME:-${ROOT}/cache/huggingface}
 HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-${HF_HOME}/datasets}
-PERSISTENT_CACHE=${PERSISTENT_CACHE:-${ROOT}/cache/nemotron_nano_v3_5_vllm020}
+PERSISTENT_CACHE=${PERSISTENT_CACHE:-${ROOT}/cache/nemotron_nano_v3_5_vllm023}
 NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR:-${PERSISTENT_CACHE}/venvs}
-NEMO_RL_VLLM_PY_EXECUTABLE=${NEMO_RL_VLLM_PY_EXECUTABLE:-uv run --locked --extra vllm --directory ${REPO_ROOT}}
+VLLM_ACTOR=nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker
+VLLM_VENV=${NEMO_RL_VENV_DIR}/${VLLM_ACTOR}
+NEMO_RL_VLLM_PY_EXECUTABLE=${NEMO_RL_VLLM_PY_EXECUTABLE:-${VLLM_VENV}/bin/python}
 WANDB_STAGE_ROOT=${WANDB_STAGE_ROOT:-${ROOT}/cache/wandb}
 NEMO_GYM_VENV_DIR=${NEMO_GYM_VENV_DIR:-/opt/gym_venvs}
 NEMO_GYM_UV_CACHE=${NEMO_GYM_UV_CACHE:-/tmp/nemo_gym_uv_cache}
 INDUCTOR_CACHE_DIR=/tmp/nemo_rl_inductor_cache
 TRITON_CACHE_DIR=/tmp/nemo_rl_triton_cache
-LUSTRE_VLLM_CACHE=${PERSISTENT_CACHE}/cache_write/vllm020_compile_cache_bf16
-LUSTRE_INDUCTOR_CACHE=${PERSISTENT_CACHE}/cache_write/vllm020_inductor_cache
-LUSTRE_TRITON_CACHE=${PERSISTENT_CACHE}/cache_write/vllm020_triton_cache
+LUSTRE_VLLM_CACHE=${PERSISTENT_CACHE}/cache_write/vllm023_compile_cache_bf16
+LUSTRE_INDUCTOR_CACHE=${PERSISTENT_CACHE}/cache_write/vllm023_inductor_cache
+LUSTRE_TRITON_CACHE=${PERSISTENT_CACHE}/cache_write/vllm023_triton_cache
 CACHE_SYNC_FREQUENCY=${CACHE_SYNC_FREQUENCY:-1800}
 
 require_path() {
@@ -128,6 +130,8 @@ require_path "${VAL_PATH}" "validation dataset"
 require_path "${SANDBOX_CONTAINER}" "SWE sandbox container"
 if [[ "${DRY_RUN:-0}" != "1" ]]; then
   require_path "${CONTAINER}" "combined comparison image"
+  require_path "${VLLM_VENV}/.dynamo-vllm-stack" \
+    "validated regular-vLLM 0.23 actor environment"
 fi
 for sif_subdir in swerebench nv_internal r2e_gym swegym swebench mercor/swebenchpro_ots; do
   require_path "${SIF_DIR}/${sif_subdir}" "SIF directory ${sif_subdir}"
@@ -150,7 +154,7 @@ mkdir -p \
 cat > "${RUN_LOG_DIR}/git-revision.txt" <<EOF
 superproject: $(git -C "${REPO_ROOT}" rev-parse HEAD)
 gym:          ${GYM_COMMIT}
-generation:   NeMo-RL vLLM backend (image-pinned vLLM 0.20.0)
+generation:   NeMo-RL vLLM backend (vLLM 0.23.0 linked from /opt/dynamo_venv)
 EOF
 
 SIF_FORMATTERS="[\"${SIF_DIR}/swerebench/{instance_id}.sif\",\"${SIF_DIR}/nv_internal/{instance_id}.sif\",\"${SIF_DIR}/r2e_gym/{instance_id}.sif\",\"${SIF_DIR}/swegym/sweb.eval.arm64.{instance_id}.sif\",\"${SIF_DIR}/swebench/swe-bench.eval.arm64.{instance_id}.sif\",\"${SIF_DIR}/mercor/swebenchpro_ots/{instance_id}.sif\"]"
@@ -292,7 +296,7 @@ echo "  batch: PPS=${PPS}, GPP=${GPP}, GBS=${GBS}; max_length=${MAX_LENGTH}"
 echo "  model: ${MODEL_PATH}"
 echo "  source model: ${MODEL_SOURCE_PATH}"
 echo "  image: ${CONTAINER}"
-echo "  vLLM environment: ${NEMO_RL_VENV_DIR} (locked vLLM 0.20.0)"
+echo "  vLLM environment: ${VLLM_VENV} (vLLM 0.23.0 from /opt/dynamo_venv)"
 echo "  logs:  ${RUN_LOG_DIR}"
 
 SBATCH_ARGS=(
