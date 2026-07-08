@@ -14,9 +14,14 @@ UV_CACHE_DIR=${UV_CACHE_DIR:-${PERSISTENT_CACHE}/uv}
 cd "${REPO_ROOT}"
 mkdir -p "${NEMO_RL_VENV_DIR}" "${UV_CACHE_DIR}"
 
-UV_PROJECT_ENVIRONMENT="${VLLM_VENV}" \
-UV_CACHE_DIR="${UV_CACHE_DIR}" \
-  uv run --locked --extra vllm --directory "${REPO_ROOT}" python - <<'PY'
+if [[ ! -e "${VLLM_VENV}/bin/python" ]] || \
+  ! "${VLLM_VENV}/bin/python" -c 'import vllm' >/dev/null 2>&1; then
+  UV_PROJECT_ENVIRONMENT="${VLLM_VENV}" \
+  UV_CACHE_DIR="${UV_CACHE_DIR}" \
+    uv sync --locked --extra vllm --directory "${REPO_ROOT}"
+fi
+
+"${VLLM_VENV}/bin/python" - <<'PY'
 import importlib.metadata as metadata
 import inspect
 from pathlib import Path
