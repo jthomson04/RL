@@ -59,7 +59,6 @@ def main() -> None:
         "flashinfer-cubin",
         "compressed-tensors",
         "nvidia-cutlass-dsl",
-        "nvidia-cutlass-dsl-libs-base",
         "nvidia-cutlass-dsl-libs-cu13",
     )
     version_probe = (
@@ -135,6 +134,24 @@ def main() -> None:
                 "dynamo": dynamo_version,
             }
     assert not mismatches, mismatches
+
+    try:
+        metadata.version("nvidia-cutlass-dsl-libs-base")
+    except metadata.PackageNotFoundError:
+        pass
+    else:
+        raise AssertionError("NeMo-RL must omit the overlapping CUTLASS libs-base wheel")
+    assert (
+        subprocess.check_output(
+            [
+                "/opt/dynamo_venv/bin/python",
+                "-c",
+                "import importlib.metadata as m; print(m.version('nvidia-cutlass-dsl-libs-base'))",
+            ],
+            text=True,
+        ).strip()
+        == "4.5.2"
+    )
 
     importlib.import_module("cutlass.cute")
 

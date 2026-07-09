@@ -57,10 +57,10 @@ fi
 
 # vLLM's FlashAttention 4 path imports ``cutlass.cute`` while profiling CUDA
 # graphs. Keep the complete CUTLASS DSL stack aligned with Dynamo's proven
-# environment. A metadata-only install is insufficient: the Python modules live
-# in the version-matched ``libs-base`` wheel.
+# environment. NeMo-RL intentionally excludes ``libs-base`` because the 4.5.2
+# CUDA13 wheel is a functional superset and the two wheels overlap on disk.
 if ! "${VLLM_VENV}/bin/python" -c \
-  'import importlib.metadata as m; assert all(m.version(p) == "4.5.2" for p in ("nvidia-cutlass-dsl", "nvidia-cutlass-dsl-libs-base", "nvidia-cutlass-dsl-libs-cu13")); import cutlass.cute' \
+  'import importlib.metadata as m; assert all(m.version(p) == "4.5.2" for p in ("nvidia-cutlass-dsl", "nvidia-cutlass-dsl-libs-cu13")); import cutlass.cute' \
   >/dev/null 2>&1; then
   for package in \
     nvidia-cutlass-dsl \
@@ -75,11 +75,10 @@ if ! "${VLLM_VENV}/bin/python" -c \
     fi
   done
   CUTLASS_DSL_WHEEL='https://files.pythonhosted.org/packages/f0/15/575d7df4fe2f3406f1cfc68be72aeff2834f8a696daf1cd5bee8017e4507/nvidia_cutlass_dsl-4.5.2-py3-none-any.whl#sha256=68ed1b63ca74aae87955012da9dfd7fdaae471329d0028b229b841c7192ccf52'
-  CUTLASS_BASE_WHEEL='https://files.pythonhosted.org/packages/b0/f8/b192015e273ff023a35741d6d5e4a93e4819160dee3955fc5d3d53534450/nvidia_cutlass_dsl_libs_base-4.5.2-cp313-cp313-manylinux_2_28_aarch64.whl#sha256=395bd77cf642aeef311313453e6582f11c9357a4b81fe620ea3daccd1fccab9b'
   CUTLASS_CU13_WHEEL='https://files.pythonhosted.org/packages/98/57/bc7248c02c3e4ee2ed03e194ceda9861a46fa23f0da5140bd8060a086b1e/nvidia_cutlass_dsl_libs_cu13-4.5.2-cp313-cp313-manylinux_2_28_aarch64.whl#sha256=64e994554af4da59f75754b9df1a2b1bdfdb96b58c2457802da13d586fb58cde'
   UV_CACHE_DIR="${UV_CACHE_DIR}" \
-    uv pip install --python "${VLLM_VENV}/bin/python" --no-deps \
-    "${CUTLASS_DSL_WHEEL}" "${CUTLASS_BASE_WHEEL}" "${CUTLASS_CU13_WHEEL}"
+    uv --no-config pip install --python "${VLLM_VENV}/bin/python" --no-deps \
+    "${CUTLASS_DSL_WHEEL}" "${CUTLASS_CU13_WHEEL}"
 fi
 
 ACTOR_SITE=$(
