@@ -76,9 +76,13 @@ def main() -> None:
     actor_versions = {name: metadata.version(name) for name in comparison_packages}
     optional_absent_packages = ("flashinfer-jit-cache",)
     optional_probe = (
-        "import importlib.metadata as m, json, sys; "
-        "versions = {d.metadata['Name'].lower(): d.version for d in m.distributions()}; "
-        "print(json.dumps({name: versions.get(name) for name in sys.argv[1:]}))"
+        "import importlib.metadata as m, json, sys\n"
+        "def get_version(name):\n"
+        "    try:\n"
+        "        return m.version(name)\n"
+        "    except m.PackageNotFoundError:\n"
+        "        return None\n"
+        "print(json.dumps({name: get_version(name) for name in sys.argv[1:]}))"
     )
     dynamo_optional_versions = json.loads(
         subprocess.check_output(
