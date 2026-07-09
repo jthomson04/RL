@@ -55,6 +55,30 @@ if "${VLLM_VENV}/bin/python" -c \
     uv pip uninstall --python "${VLLM_VENV}/bin/python" flashinfer-jit-cache
 fi
 
+# vLLM's FlashAttention 4 path imports ``cutlass.cute`` while profiling CUDA
+# graphs. Keep the complete CUTLASS DSL stack aligned with Dynamo's proven
+# environment. A metadata-only install is insufficient: the Python modules live
+# in the version-matched ``libs-base`` wheel.
+if ! "${VLLM_VENV}/bin/python" -c \
+  'import importlib.metadata as m; assert all(m.version(p) == "4.5.2" for p in ("nvidia-cutlass-dsl", "nvidia-cutlass-dsl-libs-base", "nvidia-cutlass-dsl-libs-cu13")); import cutlass.cute' \
+  >/dev/null 2>&1; then
+  for package in \
+    nvidia-cutlass-dsl \
+    nvidia-cutlass-dsl-libs-base \
+    nvidia-cutlass-dsl-libs-cu12 \
+    nvidia-cutlass-dsl-libs-cu13; do
+    if "${VLLM_VENV}/bin/python" -c \
+      'import importlib.metadata as m, sys; m.version(sys.argv[1])' \
+      "${package}" >/dev/null 2>&1; then
+      UV_CACHE_DIR="${UV_CACHE_DIR}" \
+        uv pip uninstall --python "${VLLM_VENV}/bin/python" "${package}"
+    fi
+  done
+  UV_CACHE_DIR="${UV_CACHE_DIR}" \
+    uv pip install --python "${VLLM_VENV}/bin/python" \
+    'nvidia-cutlass-dsl[cu13]==4.5.2'
+fi
+
 ACTOR_SITE=$(
   "${VLLM_VENV}/bin/python" -c \
     'import sysconfig; print(sysconfig.get_paths()["purelib"])'

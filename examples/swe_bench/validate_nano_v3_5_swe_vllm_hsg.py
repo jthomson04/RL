@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Read-only validation for the regular vLLM 0.23 SWE actor environment."""
 
+import importlib
 import importlib.metadata as metadata
 import inspect
 import json
@@ -57,6 +58,9 @@ def main() -> None:
         "flashinfer-python",
         "flashinfer-cubin",
         "compressed-tensors",
+        "nvidia-cutlass-dsl",
+        "nvidia-cutlass-dsl-libs-base",
+        "nvidia-cutlass-dsl-libs-cu13",
     )
     version_probe = (
         "import importlib.metadata as m, json, sys; "
@@ -74,7 +78,10 @@ def main() -> None:
         )
     )
     actor_versions = {name: metadata.version(name) for name in comparison_packages}
-    optional_absent_packages = ("flashinfer-jit-cache",)
+    optional_absent_packages = (
+        "flashinfer-jit-cache",
+        "nvidia-cutlass-dsl-libs-cu12",
+    )
     optional_probe = (
         "import importlib.metadata as m, json, sys\n"
         "def get_version(name):\n"
@@ -104,7 +111,10 @@ def main() -> None:
     assert (
         actor_optional_versions
         == dynamo_optional_versions
-        == {"flashinfer-jit-cache": None}
+        == {
+            "flashinfer-jit-cache": None,
+            "nvidia-cutlass-dsl-libs-cu12": None,
+        }
     ), {
         "regular": actor_optional_versions,
         "dynamo": dynamo_optional_versions,
@@ -125,6 +135,16 @@ def main() -> None:
                 "dynamo": dynamo_version,
             }
     assert not mismatches, mismatches
+
+    importlib.import_module("cutlass.cute")
+
+    subprocess.check_call(
+        [
+            "/opt/dynamo_venv/bin/python",
+            "-c",
+            "import cutlass.cute",
+        ]
+    )
 
     reasoning_plugin = (
         repo_root / "nemo_rl/models/generation/vllm/reasoning_parsers/"
