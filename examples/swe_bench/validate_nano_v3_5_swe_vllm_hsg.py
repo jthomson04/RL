@@ -140,13 +140,18 @@ def main() -> None:
     except metadata.PackageNotFoundError:
         pass
     else:
-        raise AssertionError("NeMo-RL must omit the overlapping CUTLASS libs-base wheel")
+        raise AssertionError(
+            "NeMo-RL must omit the overlapping CUTLASS libs-base wheel"
+        )
     assert (
         subprocess.check_output(
             [
                 "/opt/dynamo_venv/bin/python",
                 "-c",
-                "import importlib.metadata as m; print(m.version('nvidia-cutlass-dsl-libs-base'))",
+                (
+                    "import importlib.metadata as m; "
+                    "print(m.version('nvidia-cutlass-dsl-libs-base'))"
+                ),
             ],
             text=True,
         ).strip()
