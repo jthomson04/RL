@@ -43,6 +43,18 @@ if ! "${VLLM_VENV}/bin/python" -c \
   fi
 fi
 
+# Ruit's base image leaves a Python-3.13 FlashInfer 0.6.8 JIT-cache wheel in
+# actor environments. vLLM 0.23 upgrades flashinfer-python/cubin to 0.6.12,
+# and FlashInfer rejects the stale JIT cache during TP communicator startup.
+# Dynamo's proven vLLM 0.23 environment has no separate JIT-cache wheel and
+# uses the matching 0.6.12 cubin package, so mirror that exact contract.
+if "${VLLM_VENV}/bin/python" -c \
+  'import importlib.metadata as m; m.version("flashinfer-jit-cache")' \
+  >/dev/null 2>&1; then
+  UV_CACHE_DIR="${UV_CACHE_DIR}" \
+    uv pip uninstall --python "${VLLM_VENV}/bin/python" flashinfer-jit-cache
+fi
+
 ACTOR_SITE=$(
   "${VLLM_VENV}/bin/python" -c \
     'import sysconfig; print(sysconfig.get_paths()["purelib"])'

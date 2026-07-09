@@ -74,6 +74,37 @@ def main() -> None:
         )
     )
     actor_versions = {name: metadata.version(name) for name in comparison_packages}
+    optional_absent_packages = ("flashinfer-jit-cache",)
+    optional_probe = (
+        "import importlib.metadata as m, json, sys; "
+        "versions = {d.metadata['Name'].lower(): d.version for d in m.distributions()}; "
+        "print(json.dumps({name: versions.get(name) for name in sys.argv[1:]}))"
+    )
+    dynamo_optional_versions = json.loads(
+        subprocess.check_output(
+            [
+                "/opt/dynamo_venv/bin/python",
+                "-c",
+                optional_probe,
+                *optional_absent_packages,
+            ],
+            text=True,
+        )
+    )
+    actor_optional_versions = {}
+    for name in optional_absent_packages:
+        try:
+            actor_optional_versions[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            actor_optional_versions[name] = None
+    assert (
+        actor_optional_versions
+        == dynamo_optional_versions
+        == {"flashinfer-jit-cache": None}
+    ), {
+        "regular": actor_optional_versions,
+        "dynamo": dynamo_optional_versions,
+    }
     public_version_packages = {"torch", "torchaudio", "torchvision"}
     mismatches = {}
     for name in comparison_packages:
@@ -118,6 +149,10 @@ def main() -> None:
     print("vLLM source", Path(vllm.__file__).resolve())
     print("regular versions", json.dumps(actor_versions, sort_keys=True))
     print("Dynamo versions", json.dumps(dynamo_versions, sort_keys=True))
+    print(
+        "optional absent packages",
+        json.dumps(actor_optional_versions, sort_keys=True),
+    )
     print("vLLM NemotronH refit implementation: matched")
     print("tool parser qwen3_coder: registered")
     print("reasoning parser nano_v3: registered")
