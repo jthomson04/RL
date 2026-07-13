@@ -13,13 +13,205 @@
 # limitations under the License.
 
 
+import sys
+
+from omegaconf import OmegaConf
 import pytest
 import torch
 
+import examples.run_eval as run_eval
+import nemo_rl.evals.eval as eval_mod
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.evals.eval import (
+    _build_generation_inputs,
+    _generate_from_token_ids,
+    _setup_generation,
     eval_cons_k,
     eval_pass_k,
 )
+
+
+class _FakeTokenizer:
+    pad_token_id = 0
+
+    def batch_decode(self, token_ids, skip_special_tokens=True):
+        del skip_special_tokens
+        return [" ".join(str(int(token)) for token in row.tolist()) for row in token_ids]
+
+
+def _base_generation_config(backend):
+    return {
+        "backend": backend,
+        "model_name": "test-model",
+        "max_new_tokens": 16,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "stop_token_ids": [0],
+        "stop_strings": None,
+        "num_prompts_per_step": -1,
+        "_pad_token_id": 0,
+    }
+
+
+def test_run_eval_parse_args_uses_only_remaining_dotlist(monkeypatch):
+    """CLI overrides should not re-parse --config as an OmegaConf key."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_eval.py",
+            "--config",
+            "examples/configs/evals/eval_dynamo.yaml",
+            "generation.backend=dynamo",
+            "generation.dynamo_cfg.frontend_url=http://dynamo.example/v1",
+        ],
+    )
+
+    args, overrides = run_eval.parse_args()
+
+    assert args.config == "examples/configs/evals/eval_dynamo.yaml"
+    assert OmegaConf.to_container(overrides, resolve=True) == {
+        "generation": {
+            "backend": "dynamo",
+            "dynamo_cfg": {"frontend_url": "http://dynamo.example/v1"},
+        }
+    }
+
+
+def test_setup_generation_uses_no_local_cluster_for_dynamo(monkeypatch):
+    """Dynamo eval should only build the HTTP forwarder."""
+    calls = []
+
+    class FakeDynamoGeneration:
+        def __init__(self, cluster, config):
+            calls.append((cluster, config))
+            self.dp_openai_server_base_urls = ["http://dynamo.example/v1"]
+
+    def fail_cluster(*args, **kwargs):
+        raise AssertionError("Dynamo eval must not allocate a RayVirtualCluster")
+
+    monkeypatch.setattr(eval_mod, "DynamoGeneration", FakeDynamoGeneration)
+    monkeypatch.setattr(eval_mod, "RayVirtualCluster", fail_cluster)
+
+    config = _base_generation_config("dynamo")
+    config["dynamo_cfg"] = {"frontend_url": "http://dynamo.example/v1"}
+
+    generation = _setup_generation(
+        generation_config=config,
+        cluster_config={"gpus_per_node": 8, "num_nodes": 2},
+    )
+
+    assert generation.dp_openai_server_base_urls == ["http://dynamo.example/v1"]
+    assert calls == [(None, config)]
+
+
+def test_setup_generation_allocates_cluster_for_vllm(monkeypatch):
+    """vLLM eval still owns local generation workers."""
+    cluster_calls = []
+    generation_calls = []
+
+    class FakeCluster:
+        def __init__(self, **kwargs):
+            cluster_calls.append(kwargs)
+
+    class FakeVllmGeneration:
+        def __init__(self, cluster, config):
+            generation_calls.append((cluster, config))
+
+    monkeypatch.setattr(eval_mod, "RayVirtualCluster", FakeCluster)
+    monkeypatch.setattr(eval_mod, "VllmGeneration", FakeVllmGeneration)
+
+    config = _base_generation_config("vllm")
+    config["vllm_cfg"] = {
+        "async_engine": False,
+        "tensor_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "expert_parallel_size": 1,
+        "gpu_memory_utilization": 0.9,
+        "max_model_len": 2048,
+    }
+
+    _setup_generation(
+        generation_config=config,
+        cluster_config={"gpus_per_node": 4, "num_nodes": 2},
+    )
+
+    assert cluster_calls == [
+        {
+            "name": "eval_cluster",
+            "bundle_ct_per_node_list": [4, 4],
+            "use_gpus": True,
+            "num_gpus_per_node": 4,
+            "max_colocated_worker_groups": 1,
+        }
+    ]
+    assert len(generation_calls) == 1
+    assert isinstance(generation_calls[0][0], FakeCluster)
+    assert generation_calls[0][1] is config
+
+
+def test_build_generation_inputs_rejects_dynamo_multimodal():
+    batch = BatchedDataDict(
+        {
+            "message_log": [
+                [{"role": "user", "content": "look", "token_ids": torch.tensor([1])}]
+            ],
+            "vllm_content": ["<audio> prompt"],
+        }
+    )
+
+    with pytest.raises(ValueError, match="text-only"):
+        _build_generation_inputs(
+            batch=batch,
+            tokenizer=_FakeTokenizer(),
+            backend="dynamo",
+        )
+
+
+def test_generate_from_token_ids_decodes_backend_output():
+    class FakeGeneration:
+        def generate(self, data, greedy=False):
+            assert greedy is False
+            assert data["input_ids"].tolist() == [[1, 2], [3, 0]]
+            return BatchedDataDict(
+                {
+                    "output_ids": torch.tensor([[1, 2, 7, 0], [3, 9, 0, 0]]),
+                    "generation_lengths": torch.tensor([1, 1]),
+                    "unpadded_sequence_lengths": torch.tensor([3, 2]),
+                    "logprobs": torch.zeros((2, 4)),
+                }
+            )
+
+    batch = BatchedDataDict(
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "first",
+                        "token_ids": torch.tensor([1, 2]),
+                    }
+                ],
+                [
+                    {
+                        "role": "user",
+                        "content": "second",
+                        "token_ids": torch.tensor([3]),
+                    }
+                ],
+            ]
+        }
+    )
+
+    outputs = _generate_from_token_ids(
+        generation=FakeGeneration(),
+        batch=batch,
+        tokenizer=_FakeTokenizer(),
+        backend="dynamo",
+    )
+
+    assert outputs == ["7", "9"]
 
 
 def test_eval_pass_k_basic():
