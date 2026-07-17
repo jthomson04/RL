@@ -1511,7 +1511,10 @@ def job_list(
     click.echo(f"{'SUBMISSION':<40} {'STATUS':<12} ENTRYPOINT")
     for j in jobs:
         entry = (j.entrypoint or "").splitlines()[0][:80]
-        click.echo(f"{j.submission_id:<40} {j.status.value:<12} {entry}")
+        # exec-submitter runs have submission_id=None — show "(driver)" instead
+        # of crashing the formatter (driver appears in the dashboard as type=DRIVER).
+        sid = j.submission_id or "(driver)"
+        click.echo(f"{sid:<40} {j.status.value:<12} {entry}")
 
 
 @job.command("logs")

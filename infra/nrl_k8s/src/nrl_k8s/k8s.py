@@ -56,6 +56,18 @@ def load_kubeconfig() -> None:
     except config.ConfigException:
         config.load_kube_config()
 
+    # kubernetes-client 36.0.0 regression: `config.load_kube_config()` writes
+    # the bearer token under api_key['authorization'], but the OpenAPI-generated
+    # `Configuration.auth_settings()` only looks for api_key['BearerToken']. The
+    # two keys never meet and every authenticated request goes out with no
+    # Authorization header (kubectl is unaffected because it uses the Go
+    # client). Alias both keys here so we work across 35.x and 36.x without
+    # pinning the dependency upper bound.
+    cfg = client.Configuration.get_default_copy()
+    if "authorization" in cfg.api_key and "BearerToken" not in cfg.api_key:
+        cfg.api_key["BearerToken"] = cfg.api_key["authorization"]
+        client.Configuration.set_default(cfg)
+
 
 def custom_objects_api() -> client.CustomObjectsApi:
     load_kubeconfig()

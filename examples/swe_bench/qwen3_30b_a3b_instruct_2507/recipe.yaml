@@ -1,0 +1,148 @@
+# Production rollout recipe: full SWE-bench Verified (281 samples) with
+# mini_swe_agent + Qwen3-30B-A3B-Instruct-2507 via Dynamo.
+#
+# Reproducibility note: this recipe is the *complete* spec for the
+# production run — step_limit, concurrency, dataset path are all baked in
+# here so `run_dynamo_rollout_only.py --config <this>` reproduces the run
+# end-to-end. The only Hydra overrides the launching infra YAML injects
+# are `dynamo_cfg.dgd_name` and `dynamo_cfg.frontend_port`, both of which
+# encode the per-user DGD identity that cannot be expressed inline.
+#
+# Sizing: paired with `dgd.gb300.yaml` (4 vllm workers × 2 GPU × TP=2, 8
+# GB300 total). Expected wall-clock ~56 min for 281 samples at
+# concurrency=16, matching jthomson04's 2026-05-19 production rollout.
+#
+# The model's official native context length is 262144 tokens. We pin the
+# rollout-side to 192K = 196608 (slightly below native) to leave headroom
+# for KV cache + safer scheduling without changing the agent UX. Keep
+# policy.max_total_sequence_length aligned with the Dynamo/vLLM max-model-len.
+
+defaults: ../../nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
+
+grpo:
+  num_prompts_per_step: 1
+  num_generations_per_prompt: 1
+  max_rollout_turns: 1
+  max_num_steps: 1
+  val_period: 999999
+  val_at_start: false
+  val_at_end: false
+
+policy:
+  model_name: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 196608
+  precision: "bfloat16"
+  make_sequence_length_divisible_by: 8
+
+  dtensor_cfg:
+    enabled: false
+
+  megatron_cfg:
+    enabled: true
+    converter_type: Qwen3MoeForCausalLM
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    empty_unused_memory_level: 2
+    defer_fp32_logits: true
+    freeze_moe_router: false
+    moe_router_dtype: null
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 0.0
+    moe_permute_fusion: false
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_shared_expert_overlap: false
+    moe_per_layer_logging: false
+    track_moe_metrics: false
+    moe_router_enable_expert_bias: false
+    moe_aux_loss_coeff: 0.0
+    optimizer:
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
+  generation:
+    backend: "dynamo"
+    max_new_tokens: 8192
+    dynamo_cfg:
+      tool_call_parser: "hermes"
+      prometheus_metrics:
+        enabled: true
+        service_names: ["vllmdecodeworker", "frontend:8000"]
+        extra_endpoints:
+          - name: dcgm
+            url: "http://nvidia-dcgm-exporter.gpu-operator.svc.cluster.local:9400/metrics"
+        collection_interval: 10
+        timeout: 5
+        include_histogram_buckets: true
+        export:
+          enabled: true
+    colocated:
+      enabled: false
+
+env:
+  nemo_gym:
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/mini_swe_agent/configs/mini_swe_agent.yaml
+    is_trajectory_collection: true
+    mini_swe_simple_agent:
+      responses_api_agents:
+        mini_swe_agent:
+          # Production: 50 agent turns max per sample. Default in
+          # mini_swe_agent.yaml is 250, but 5/19 production data shows
+          # median 9 turns / p95 50 turns — anything past 50 is the agent
+          # spinning without making progress.
+          step_limit: 50
+          # 16 in-flight agent state machines per Ray actor (asyncio
+          # semaphore). Matches the production setting; vllm cluster is
+          # sized to absorb this concurrency.
+          concurrency: 16
+          cache_dir_template: "/mnt/rl-workspace/jothomson/swebench_containers/swebench_sweb.eval.arm64.{instance_id}.sif"
+          run_golden: false
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: false
+          extra_body:
+            temperature: 0.7
+            top_p: 0.8
+
+data:
+  # Full SWE-bench Verified arm64 dataset (281 rows). jothomson maintains
+  # the canonical copy; this path is read-only-shared across users.
+  train:
+    data_path: /mnt/rl-workspace/jothomson/swebench_containers/swebench_verified_arm64_mini_swe_full.jsonl
+  validation:
+    data_path: /mnt/rl-workspace/jothomson/swebench_containers/swebench_verified_arm64_mini_swe_full.jsonl
+
+checkpointing:
+  enabled: false
+
+logger:
+  log_dir: "logs/grpo-mini-swe-qwen3-30b-a3b-instruct-2507-rollout-full"
+  num_val_samples_to_print: 0
+  wandb_enabled: true
+  wandb:
+    project: "nemo-gym-swe-dynamo"
+    name: "qwen3-30b-a3b-instruct-2507-mini-swe-rollout-full"
+    group: "qwen3-30b-a3b-instruct-2507-mini-swe-rollout-full"
+    job_type: "rollout"
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: false
+
+cluster:
+  gpus_per_node: 0
+  num_nodes: 1

@@ -1,0 +1,1314 @@
+{
+  "title": "Dynamo vLLM",
+  "uid": "dynamo-vllm-template",
+  "refresh": "1m",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "schemaVersion": 38,
+  "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Deployment Config",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 200,
+      "type": "text",
+      "title": "",
+      "options": {
+        "mode": "markdown",
+        "content": "### Static deployment metadata\n| | |\n|---|---|\n| **Run** | `nemotron-nano-v3-clean` |\n| **Model** | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` |\n| **Image** | `nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.0` (vLLM 0.19.0) |\n| **Router mode** | `round-robin` (KV mode incompat. w/ NemotronH hybrid cache) |\n| **Worker count** | 4 \u00d7 2 GPU on NVIDIA-GB300 |\n| **TP size** | 2 |\n| **GPU memory util** | 0.85 |\n| **Client concurrency** | `num_samples_in_parallel=8` |\n| **Agent** | `mini_swe_agent` (`concurrency=16`) |\n| **Sandbox** | apptainer + jothomson arm64 SIFs |\n\n\u26a0\ufe0f NemotronH hybrid (Mamba + Attention) \u2192 `vllm:kv_cache_usage_perc` not emitted, KV cache % panels show N/A.\n"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 12,
+        "h": 6
+      }
+    },
+    {
+      "id": 201,
+      "type": "table",
+      "title": "vllm:cache_config_info (live)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "vllm:cache_config_info{pod=~\"$pod_regex\"}",
+          "instant": true,
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true,
+              "__name__": true,
+              "container": true,
+              "endpoint": true,
+              "instance": true,
+              "job": true,
+              "namespace": true,
+              "engine": true,
+              "dynamo_component": true,
+              "dynamo_endpoint": true,
+              "dynamo_namespace": true,
+              "worker_id": true
+            }
+          }
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 1,
+        "w": 12,
+        "h": 6
+      }
+    },
+    {
+      "id": 202,
+      "type": "stat",
+      "title": "Max Context Length",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "max(dynamo_frontend_model_context_length{pod=~\"$pod_regex\"})",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 6,
+        "h": 4
+      }
+    },
+    {
+      "id": 203,
+      "type": "stat",
+      "title": "Max Batched Tokens",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "max(dynamo_frontend_model_max_num_batched_tokens{pod=~\"$pod_regex\"})",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 6,
+        "y": 7,
+        "w": 6,
+        "h": 4
+      }
+    },
+    {
+      "id": 204,
+      "type": "stat",
+      "title": "Max Concurrent Seqs",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "max(dynamo_frontend_model_max_num_seqs{pod=~\"$pod_regex\"})",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 7,
+        "w": 6,
+        "h": 4
+      }
+    },
+    {
+      "id": 205,
+      "type": "stat",
+      "title": "Total KV Blocks per worker",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "max(dynamo_frontend_model_total_kv_blocks{pod=~\"$pod_regex\"})",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 18,
+        "y": 7,
+        "w": 6,
+        "h": 4
+      }
+    },
+    {
+      "id": 101,
+      "type": "row",
+      "title": "Overview",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 11,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 1,
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 6,
+        "h": 4
+      },
+      "type": "stat",
+      "title": "KV Cache Usage (avg) \u2014 N/A for NemotronH",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "avg(dynamo_component_gpu_cache_usage_percent{pod=~\"$pod_regex\"})",
+          "legendFormat": "avg"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "gridPos": {
+        "x": 6,
+        "y": 12,
+        "w": 6,
+        "h": 4
+      },
+      "type": "stat",
+      "title": "In-flight Requests",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "sum(dynamo_component_inflight_requests{pod=~\"$pod_regex\",dynamo_endpoint=\"generate\"})",
+          "legendFormat": "total"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "gridPos": {
+        "x": 12,
+        "y": 12,
+        "w": 6,
+        "h": 4
+      },
+      "type": "stat",
+      "title": "Requests Waiting",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 5
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
+            ]
+          }
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "sum(vllm:num_requests_waiting{pod=~\"$pod_regex\"})",
+          "legendFormat": "queued"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "gridPos": {
+        "x": 18,
+        "y": 12,
+        "w": 6,
+        "h": 4
+      },
+      "type": "stat",
+      "title": "KV Hit Rate (p50)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(vllm:prefix_cache_hits_total{pod=~\"$pod_regex\"}[5m])) / sum(rate(vllm:prefix_cache_queries_total{pod=~\"$pod_regex\"}[5m]))",
+          "legendFormat": "prefix-cache hit ratio"
+        }
+      ]
+    },
+    {
+      "id": 102,
+      "type": "row",
+      "title": "Throughput",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 26,
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 24,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "Total Token Throughput (prefill + decode, tokens/s)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(vllm:prompt_tokens_total{pod=~\"$pod_regex\"}[1m])) + sum(rate(vllm:generation_tokens_total{pod=~\"$pod_regex\"}[1m]))",
+          "legendFormat": "total"
+        },
+        {
+          "expr": "sum(rate(vllm:prompt_tokens_total{pod=~\"$pod_regex\"}[1m]))",
+          "legendFormat": "prefill"
+        },
+        {
+          "expr": "sum(rate(vllm:generation_tokens_total{pod=~\"$pod_regex\"}[1m]))",
+          "legendFormat": "decode"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "gridPos": {
+        "x": 0,
+        "y": 25,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "Decode Throughput (tokens/s)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(vllm:generation_tokens_total{pod=~\"$pod_regex\"}[1m]))",
+          "legendFormat": "tokens/s"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "gridPos": {
+        "x": 12,
+        "y": 25,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "Prefill Throughput (tokens/s)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(vllm:prompt_tokens_total{pod=~\"$pod_regex\"}[1m]))",
+          "legendFormat": "prompt tokens/s"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "gridPos": {
+        "x": 0,
+        "y": 33,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "Decode Throughput per Worker (tokens/s)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (pod) (rate(vllm:generation_tokens_total{pod=~\"$pod_regex\"}[1m]))",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "gridPos": {
+        "x": 12,
+        "y": 33,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "Prefill Throughput per Worker (tokens/s)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (pod) (rate(vllm:prompt_tokens_total{pod=~\"$pod_regex\"}[1m]))",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    },
+    {
+      "id": 103,
+      "type": "row",
+      "title": "Latency",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 58,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 7,
+      "gridPos": {
+        "x": 0,
+        "y": 59,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "TTFT P50 / P99 (s)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(vllm:time_to_first_token_seconds_bucket{pod=~\"$pod_regex\"}[2m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(vllm:time_to_first_token_seconds_bucket{pod=~\"$pod_regex\"}[2m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "gridPos": {
+        "x": 12,
+        "y": 59,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "TTFT P95 (s)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(vllm:time_to_first_token_seconds_bucket{pod=~\"$pod_regex\"}[2m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "gridPos": {
+        "x": 0,
+        "y": 67,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "ITL P99 (s)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(vllm:inter_token_latency_seconds_bucket{pod=~\"$pod_regex\"}[2m])) by (le))",
+          "legendFormat": "p99 ITL"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "gridPos": {
+        "x": 12,
+        "y": 67,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "ITL P50 / P95 (s)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(vllm:inter_token_latency_seconds_bucket{pod=~\"$pod_regex\"}[2m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(vllm:inter_token_latency_seconds_bucket{pod=~\"$pod_regex\"}[2m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "gridPos": {
+        "x": 0,
+        "y": 75,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "E2E Request Latency P50/P95/P99 (s)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(vllm:e2e_request_latency_seconds_bucket{pod=~\"$pod_regex\"}[2m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(vllm:e2e_request_latency_seconds_bucket{pod=~\"$pod_regex\"}[2m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(vllm:e2e_request_latency_seconds_bucket{pod=~\"$pod_regex\"}[2m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "gridPos": {
+        "x": 12,
+        "y": 75,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "Time in Queue P50 / P99 (s)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(vllm:request_queue_time_seconds_bucket{pod=~\"$pod_regex\"}[2m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(vllm:request_queue_time_seconds_bucket{pod=~\"$pod_regex\"}[2m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 104,
+      "type": "row",
+      "title": "KV Cache & Queue Dynamics",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 83,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 5,
+      "gridPos": {
+        "x": 0,
+        "y": 84,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "KV Cache Usage per Worker \u2014 N/A for NemotronH",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "dynamo_component_gpu_cache_usage_percent{pod=~\"$pod_regex\"}",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "gridPos": {
+        "x": 12,
+        "y": 84,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "In-flight Requests per Worker",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "dynamo_component_inflight_requests{pod=~\"$pod_regex\",dynamo_endpoint=\"generate\"}",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "gridPos": {
+        "x": 0,
+        "y": 92,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "KV Hit Rate P99",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(vllm:prefix_cache_hits_total{pod=~\"$pod_regex\"}[5m])) / sum(rate(vllm:prefix_cache_queries_total{pod=~\"$pod_regex\"}[5m]))",
+          "legendFormat": "prefix-cache hit ratio"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "gridPos": {
+        "x": 12,
+        "y": 92,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "Preemptions / min",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(vllm:num_preemptions_total{pod=~\"$pod_regex\"}[1m])) * 60",
+          "legendFormat": "preemptions/min"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "gridPos": {
+        "x": 0,
+        "y": 100,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "Requests Running vs Waiting",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "sum(vllm:num_requests_running{pod=~\"$pod_regex\"})",
+          "legendFormat": "running"
+        },
+        {
+          "expr": "sum(vllm:num_requests_waiting{pod=~\"$pod_regex\"})",
+          "legendFormat": "waiting"
+        }
+      ]
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "Requests Running per Worker",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (pod) (vllm:num_requests_running{pod=~\"$pod_regex\"})",
+          "legendFormat": "{{pod}}"
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 100,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Iteration Tokens P50 / P95 (batch density)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(vllm:iteration_tokens_total_bucket{pod=~\"$pod_regex\"}[2m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(vllm:iteration_tokens_total_bucket{pod=~\"$pod_regex\"}[2m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 108,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "id": 105,
+      "type": "row",
+      "title": "Workload Characterization",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 116,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 18,
+      "gridPos": {
+        "x": 0,
+        "y": 117,
+        "w": 12,
+        "h": 8
+      },
+      "type": "heatmap",
+      "title": "Prefill Token Length Distribution",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "yAxis": {
+          "unit": "short"
+        },
+        "calculate": false,
+        "cellGap": 1,
+        "color": {
+          "scheme": "Reds",
+          "mode": "scheme",
+          "reverse": true,
+          "steps": 64,
+          "exponent": 1.0
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(vllm:request_prompt_tokens_bucket{pod=~\"$pod_regex\"}[1m])) by (le)",
+          "format": "heatmap",
+          "legendFormat": "{{le}}"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "gridPos": {
+        "x": 12,
+        "y": 117,
+        "w": 12,
+        "h": 8
+      },
+      "type": "heatmap",
+      "title": "Decode Token Length Distribution",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "yAxis": {
+          "unit": "short"
+        },
+        "calculate": false,
+        "cellGap": 1,
+        "color": {
+          "scheme": "Reds",
+          "mode": "scheme",
+          "reverse": true,
+          "steps": 64,
+          "exponent": 1.0
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(vllm:request_generation_tokens_bucket{pod=~\"$pod_regex\"}[1m])) by (le)",
+          "format": "heatmap",
+          "legendFormat": "{{le}}"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "gridPos": {
+        "x": 0,
+        "y": 125,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "Prefill Token Length P50 / P95 / P99",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(vllm:request_prompt_tokens_bucket{pod=~\"$pod_regex\"}[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(vllm:request_prompt_tokens_bucket{pod=~\"$pod_regex\"}[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(vllm:request_prompt_tokens_bucket{pod=~\"$pod_regex\"}[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "gridPos": {
+        "x": 12,
+        "y": 125,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "Decode Token Length P50 / P95 / P99",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(vllm:request_generation_tokens_bucket{pod=~\"$pod_regex\"}[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(vllm:request_generation_tokens_bucket{pod=~\"$pod_regex\"}[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(vllm:request_generation_tokens_bucket{pod=~\"$pod_regex\"}[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 106,
+      "type": "row",
+      "title": "GPU (DCGM)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 133,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 20,
+      "gridPos": {
+        "x": 0,
+        "y": 134,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "GPU Utilization %",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_GPU_UTIL{exported_pod=~\"$pod_regex\"}",
+          "legendFormat": "{{exported_pod}} gpu{{gpu}}"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "gridPos": {
+        "x": 12,
+        "y": 134,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "GPU Memory Used (GB)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decgbytes"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_FB_USED{exported_pod=~\"$pod_regex\"} / 1024",
+          "legendFormat": "{{exported_pod}} gpu{{gpu}}"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "gridPos": {
+        "x": 0,
+        "y": 142,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "GPU Power (W)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "watt"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_POWER_USAGE{exported_pod=~\"$pod_regex\"}",
+          "legendFormat": "{{exported_pod}} gpu{{gpu}}"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "gridPos": {
+        "x": 12,
+        "y": 142,
+        "w": 12,
+        "h": 8
+      },
+      "type": "timeseries",
+      "title": "Tensor Pipe Active %",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_PROF_PIPE_TENSOR_ACTIVE{exported_pod=~\"$pod_regex\"} * 100",
+          "legendFormat": "{{exported_pod}} gpu{{gpu}}"
+        }
+      ]
+    },
+    {
+      "id": 1041,
+      "type": "row",
+      "title": "Throughput (Bytes \u2014 raw Dynamo counter, comparable to sglang dashboard)",
+      "gridPos": {
+        "x": 0,
+        "y": 41,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "id": 1042,
+      "type": "timeseries",
+      "title": "Total Bytes/sec (req + resp)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(dynamo_component_request_bytes_total{pod=~\"$pod_regex\",dynamo_endpoint=\"generate\"}[1m])) + sum(rate(dynamo_component_response_bytes_total{pod=~\"$pod_regex\",dynamo_endpoint=\"generate\"}[1m]))",
+          "refId": "A",
+          "legendFormat": "B/s"
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 42,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "id": 1043,
+      "type": "timeseries",
+      "title": "Response Bytes/sec (\u2248 decode bytes)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(dynamo_component_response_bytes_total{pod=~\"$pod_regex\",dynamo_endpoint=\"generate\"}[1m]))",
+          "refId": "A",
+          "legendFormat": "resp B/s"
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 42,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "id": 1044,
+      "type": "timeseries",
+      "title": "Request Bytes/sec (\u2248 prefill bytes)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(dynamo_component_request_bytes_total{pod=~\"$pod_regex\",dynamo_endpoint=\"generate\"}[1m]))",
+          "refId": "A",
+          "legendFormat": "req B/s"
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 50,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "id": 1045,
+      "type": "timeseries",
+      "title": "Response Bytes/sec per Worker",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (worker_id) (rate(dynamo_component_response_bytes_total{pod=~\"$pod_regex\",dynamo_endpoint=\"generate\"}[1m]))",
+          "refId": "A",
+          "legendFormat": "{{worker_id}}"
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 50,
+        "w": 12,
+        "h": 8
+      }
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "pod_regex",
+        "type": "textbox",
+        "label": "Pod regex",
+        "description": "PromQL pod=~ filter for all panel queries. Default '.*' = no filter (all pods).",
+        "current": {
+          "value": ".*",
+          "text": ".*",
+          "selected": false
+        },
+        "query": ".*",
+        "hide": 0,
+        "skipUrlSync": false,
+        "options": [
+          {
+            "selected": true,
+            "text": ".*",
+            "value": ".*"
+          }
+        ]
+      }
+    ]
+  },
+  "id": null
+}
