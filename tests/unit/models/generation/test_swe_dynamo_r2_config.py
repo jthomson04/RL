@@ -46,6 +46,21 @@ def test_r2_only_changes_scale_steps_and_wandb() -> None:
             "vllm_cfg",
             "vllm_metrics_logger_interval",
         ),
+        ("policy", "generation", "dynamo_cfg", "frontend_args", "tokenizer"),
+        (
+            "policy",
+            "generation",
+            "dynamo_cfg",
+            "frontend_args",
+            "tokenizer_cache",
+        ),
+        (
+            "policy",
+            "generation",
+            "dynamo_cfg",
+            "frontend_args",
+            "tokenizer_cache_bytes",
+        ),
         ("policy", "generation", "colocated", "resources", "num_nodes"),
         ("logger", "wandb_enabled"),
         ("logger", "wandb", "name"),
@@ -81,6 +96,10 @@ def test_r2_topology_batch_and_wandb_contract() -> None:
     }
     assert generation["vllm_cfg"]["enable_vllm_metrics_logger"] is True
     assert generation["vllm_cfg"]["vllm_metrics_logger_interval"] == 0.5
+    frontend_args = generation["dynamo_cfg"]["frontend_args"]
+    assert frontend_args["tokenizer"] == "fastokens"
+    assert frontend_args["tokenizer_cache"] is True
+    assert frontend_args["tokenizer_cache_bytes"] == 4 * 1024**3
     assert config["logger"]["wandb_enabled"] is True
     assert config["logger"]["wandb"]["project"] == "nemo-rl-dynamo-swe"
 

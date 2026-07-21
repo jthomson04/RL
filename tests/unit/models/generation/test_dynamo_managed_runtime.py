@@ -71,6 +71,31 @@ def test_namespace_defaults_to_sanitized_slurm_job_id(monkeypatch) -> None:
     assert _managed_namespace("My Namespace") == "my-namespace"
 
 
+def test_frontend_tokenizer_environment_is_config_owned(monkeypatch) -> None:
+    monkeypatch.setenv("DYN_TOKENIZER", "wrong")
+    monkeypatch.setenv("DYN_TOKENIZER_CACHE", "0")
+    monkeypatch.setenv("DYN_TOKENIZER_CACHE_BYTES", "1")
+    runtime = object.__new__(ManagedDynamoRuntime)
+    runtime._manager_env = {"DYN_NAMESPACE": "nemo-rl-test"}
+    runtime._dynamo_cfg = DynamoCfg.model_validate(
+        {
+            "deployment": "ray",
+            "engine_world_size": 1,
+            "frontend_args": {
+                "tokenizer": "fastokens",
+                "tokenizer_cache": True,
+                "tokenizer_cache_bytes": 4 * 1024**3,
+            },
+        }
+    )
+
+    assert "DYN_TOKENIZER" not in runtime._service_env()
+    frontend_env = runtime._frontend_env()
+    assert frontend_env["DYN_TOKENIZER"] == "fastokens"
+    assert frontend_env["DYN_TOKENIZER_CACHE"] == "1"
+    assert frontend_env["DYN_TOKENIZER_CACHE_BYTES"] == "4294967296"
+
+
 def test_system_ports_are_unique_across_tp1_groups() -> None:
     assert [_system_port_for_group(29000, idx) for idx in range(8)] == list(
         range(29000, 29008)

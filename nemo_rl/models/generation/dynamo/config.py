@@ -46,6 +46,9 @@ class DynamoWorkerArgs(BaseModel, extra="forbid"):
 class DynamoFrontendArgs(BaseModel, extra="forbid"):
     """Arguments for the Ray-managed Dynamo frontend."""
 
+    tokenizer: Literal["default", "fastokens"] = "default"
+    tokenizer_cache: bool = False
+    tokenizer_cache_bytes: PositiveInt = 50 * 1024 * 1024
     router_mode: Literal[
         "round-robin",
         "random",

@@ -331,6 +331,9 @@ policy:
         endpoint_types: [chat, completions]
         extra_cli_args: []
       frontend_args:
+        tokenizer: fastokens
+        tokenizer_cache: true
+        tokenizer_cache_bytes: 4294967296
         router_mode: round-robin
         router_reset_states: true
         extra_cli_args: []
