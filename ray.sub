@@ -81,11 +81,21 @@ export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 # Setting ulimit is recommended by ray best practices page
 # @ https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html
 # It's session based and won't affect the system outside the script
-# Ensure that the soft limit isn't above the hard limit
-if [[ $(ulimit -Hn) == "unlimited" ]] || [[ 65535 -lt $(ulimit -Hn) ]]; then
-  ulimit -Sn 65535
-elif [[ $(ulimit -Hn) != "unlimited" ]] && [[ $(ulimit -Hn) -lt 65535 ]]; then
-  echo "[WARNING]: Cannot increase ulimit on file descriptors to 65535 according ray recommendation: https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html. Speak to cluster admins to increase, otherwise ray may crash unexpectedly."
+# Ensure that the soft limit isn't above the hard limit. Raise it as high as the hard
+# limit allows rather than capping at 65535: SWE-agent rollouts at high concurrency --
+# and especially the Dynamo backend, which adds frontend + RL-worker sockets on each
+# node -- exhaust sockets at 65535 and fail with ClientOSError. Override the target
+# with NRL_NOFILE_TARGET (an "unlimited" hard limit is capped to this finite value).
+NRL_NOFILE_TARGET=${NRL_NOFILE_TARGET:-524288}
+_nrl_hard_nofile=$(ulimit -Hn)
+if [[ "${_nrl_hard_nofile}" == "unlimited" ]] || [[ "${_nrl_hard_nofile}" -ge "${NRL_NOFILE_TARGET}" ]]; then
+  ulimit -Sn "${NRL_NOFILE_TARGET}"
+else
+  # Hard limit below the target: take all of it (best effort).
+  ulimit -Sn "${_nrl_hard_nofile}"
+  if [[ "${_nrl_hard_nofile}" -lt 65535 ]]; then
+    echo "[WARNING]: file-descriptor hard limit is ${_nrl_hard_nofile} (< 65535 ray recommendation @ https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html); ray/rollouts may crash under load. Ask cluster admins to raise it."
+  fi
 fi
 
 # Worker port range must NOT overlap with the OS ephemeral range (32768-60999)
