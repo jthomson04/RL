@@ -11,18 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Generation and NCCL refit through a driver-owned Dynamo vLLM fleet."""
+"""Generation and NCCL refit through managed or external Dynamo vLLM fleets."""
 
 import asyncio
 import logging
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional, Protocol
 
 import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.models.generation.dynamo.config import DynamoConfig
+from nemo_rl.models.generation.dynamo.config import (
+    DynamoConfig,
+    DynamoGraphDeploymentCfg,
+)
 from nemo_rl.models.generation.dynamo.http_client import (
     async_http_post_json,
     format_dynamo_error,
@@ -40,6 +43,32 @@ from nemo_rl.models.generation.interfaces import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+class _DynamoRuntime(Protocol):
+    """Lifecycle and discovery contract shared by Dynamo runtimes."""
+
+    @property
+    def frontend_url(self) -> str:
+        """Return the OpenAI-compatible frontend URL."""
+        ...
+
+    def start(self) -> None:
+        """Start or resolve the runtime."""
+        ...
+
+    def refit_workers(self) -> list[dict[str, Any]]:
+        """Return fixed worker admin endpoints."""
+        ...
+
+    def validate_workers(self, expected: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return the current worker fleet after validating membership."""
+        ...
+
+    def shutdown(self) -> None:
+        """Stop any resources owned by this runtime."""
+        ...
+
 
 _HTTP_MAX_ATTEMPTS = 3
 _HTTP_RETRY_DELAY_S = 1.0
@@ -140,7 +169,7 @@ def _parse_dynamo_completion_response(
 
 
 class DynamoGeneration(GenerationInterface):
-    """Own a fixed Dynamo service fleet and expose it for NeMo-RL rollouts."""
+    """Use a fixed Dynamo service fleet for generation and NCCL refit."""
 
     def __init__(
         self,
@@ -173,29 +202,48 @@ class DynamoGeneration(GenerationInterface):
                         "policy.tokenizer.chat_template_kwargs must be a dictionary."
                     )
                 tokenizer_chat_template_kwargs = dict(chat_template_kwargs)
-        if cluster is None:
-            raise RuntimeError(
-                "Managed Dynamo requires a non-colocated inference RayVirtualCluster."
+        self._managed_runtime: ManagedDynamoRuntime | None = None
+        if isinstance(dynamo_cfg, DynamoGraphDeploymentCfg):
+            from nemo_rl.models.generation.dynamo.external_runtime import (
+                ExternalDynamoRuntime,
             )
-        self._managed_runtime: Optional[ManagedDynamoRuntime] = ManagedDynamoRuntime(
-            cluster=cluster,
-            config=self.cfg,
-        )
+
+            runtime: _DynamoRuntime = ExternalDynamoRuntime(config=self.cfg)
+            exclude_tools_when_tool_choice_none = (
+                dynamo_cfg.exclude_tools_when_tool_choice_none
+            )
+        else:
+            if cluster is None:
+                raise RuntimeError(
+                    "Managed Dynamo requires a non-colocated "
+                    "inference RayVirtualCluster."
+                )
+            managed_runtime = ManagedDynamoRuntime(
+                cluster=cluster,
+                config=self.cfg,
+            )
+            self._managed_runtime = managed_runtime
+            runtime = managed_runtime
+            exclude_tools_when_tool_choice_none = (
+                dynamo_cfg.worker_args.exclude_tools_when_tool_choice_none
+            )
+
+        self._runtime: _DynamoRuntime | None = runtime
         self._token_wrapper_server: Optional[DynamoTokenWrapperServer] = None
         self._dynamo_frontend_base_url = ""
         self.dp_openai_server_base_urls: list[Optional[str]] = []
         self._refit_channel: DynamoRefitChannel | None = None
         self._metrics_sampler: DynamoMetricsSampler | None = None
         try:
-            self._managed_runtime.start()
-            url = self._managed_runtime.frontend_url
+            runtime.start()
+            url = runtime.frontend_url
             self._dynamo_frontend_base_url = url
-            workers = self._managed_runtime.refit_workers()
+            workers = runtime.refit_workers()
             self._refit_channel = DynamoRefitChannel(
                 workers,
                 engine_world_size=validated_config.engine_world_size,
                 control_timeout_s=dynamo_cfg.control_timeout_s,
-                validate_workers=self._managed_runtime.validate_workers,
+                validate_workers=runtime.validate_workers,
             )
 
             if expose_http_server:
@@ -203,9 +251,7 @@ class DynamoGeneration(GenerationInterface):
                     dynamo_frontend_base_url=url,
                     tokenizer=tokenizer,
                     tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
-                    exclude_tools_when_tool_choice_none=(
-                        dynamo_cfg.worker_args.exclude_tools_when_tool_choice_none
-                    ),
+                    exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
                     request_timeout_s=dynamo_cfg.request_timeout_s,
                 )
                 wrapper_url = self._token_wrapper_server.start()
@@ -275,7 +321,7 @@ class DynamoGeneration(GenerationInterface):
         return channel.sender_spec
 
     def shutdown(self) -> bool:
-        """Stop process-local helpers and any driver-owned managed runtime."""
+        """Stop process-local helpers and resources owned by the runtime."""
         sampler = self._metrics_sampler
         self._metrics_sampler = None
         if sampler is not None:
@@ -290,13 +336,14 @@ class DynamoGeneration(GenerationInterface):
                 token_wrapper_server.shutdown()
             except Exception:
                 LOGGER.exception("Failed to stop the Dynamo token wrapper")
-        managed_runtime = self._managed_runtime
+        runtime = self._runtime
+        self._runtime = None
         self._managed_runtime = None
-        if managed_runtime is not None:
+        if runtime is not None:
             try:
-                managed_runtime.shutdown()
+                runtime.shutdown()
             except Exception:
-                LOGGER.exception("Failed to stop the managed Dynamo runtime")
+                LOGGER.exception("Failed to stop the Dynamo runtime")
         self._refit_channel = None
         return True
 
@@ -309,7 +356,7 @@ class DynamoGeneration(GenerationInterface):
 
         Driver-owned subprocesses, threads, and Ray worker handles are excluded.
         The endpoint-only refit channel is retained so AREAL-style cache
-        invalidation still reaches every managed worker after deserialization.
+        invalidation still reaches every worker after deserialization.
         """
         refit_channel = self._refit_channel
         return {
@@ -334,6 +381,7 @@ class DynamoGeneration(GenerationInterface):
         self._token_wrapper_server = None
         self._managed_runtime = None
         self._metrics_sampler = None
+        self._runtime = None
         self._refit_channel = state["_refit_channel"]
 
     def _completion_url(self) -> str:
@@ -610,7 +658,7 @@ class DynamoGeneration(GenerationInterface):
         *,
         train_world_size: int,
     ) -> list[ray.ObjectRef]:
-        """Initialize native vLLM NCCL transfer on every managed worker."""
+        """Initialize native vLLM NCCL transfer on every Dynamo worker."""
         channel = self._refit_channel
         if channel is None:
             raise RuntimeError("Dynamo refit channel is unavailable")

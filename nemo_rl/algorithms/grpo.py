@@ -99,7 +99,11 @@ from nemo_rl.experience.rollouts import (
     run_nemo_gym_rollout_sync,
     should_mask_flagged_samples,
 )
-from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
+from nemo_rl.models.generation.dynamo import (
+    DynamoConfig,
+    DynamoGeneration,
+    DynamoGraphDeploymentCfg,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
@@ -441,7 +445,7 @@ def setup(
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
     Optional[EnvironmentInterface],
-    tuple[RayVirtualCluster, RayVirtualCluster],
+    tuple[RayVirtualCluster, Optional[RayVirtualCluster]],
     StatefulDataLoader | MultipleDataloaderWrapper,
     Optional[StatefulDataLoader],
     ClippedPGLossFn,
@@ -482,21 +486,27 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for GRPO"
     )
+    is_external_dynamo = False
     if generation_config["backend"] == "vllm":
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
     elif generation_config["backend"] == "dynamo":
-        # Validate the complete managed-Dynamo boundary before allocating Ray
-        # placement groups or starting any external services.
+        # Validate the complete Dynamo boundary before allocating Ray placement
+        # groups or starting any services.
         if grpo_config.async_grpo.in_flight_weight_updates:
             raise ValueError(
                 "grpo.async_grpo.in_flight_weight_updates must be false when "
-                "policy.generation.backend='dynamo'; managed Dynamo drains "
-                "rollouts before layerwise weight refit"
+                "policy.generation.backend='dynamo'; Dynamo drains rollouts "
+                "before layerwise weight refit"
             )
         generation_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
             policy_config.get("hf_config_overrides") or {}
         )
-        generation_config = DynamoConfig.model_validate(generation_config).model_dump()
+        validated_dynamo_config = DynamoConfig.model_validate(generation_config)
+        is_external_dynamo = isinstance(
+            validated_dynamo_config.dynamo_cfg,
+            DynamoGraphDeploymentCfg,
+        )
+        generation_config = validated_dynamo_config.model_dump()
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
 
@@ -806,7 +816,45 @@ def setup(
             flush=True,
         )
 
-    if colocated_inference:
+    if is_external_dynamo:
+        if total_nodes == 1:
+            train_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
+        else:
+            train_gpus_per_node = cluster_config["gpus_per_node"]
+        assert train_gpus_per_node > 0, (
+            "External Dynamo training requires at least one GPU after "
+            "reward-model resources are reserved."
+        )
+
+        node_resource_constraints, policy_remaining_ids, policy_topology = (
+            prepare_segment_topology(segment_size, policy_nodes)
+        )
+        if segment_size is not None:
+            teacher_segment_topology = {
+                node_id: policy_topology[node_id] for node_id in policy_remaining_ids
+            }
+        train_cluster = RayVirtualCluster(
+            name="grpo_train_cluster",
+            bundle_ct_per_node_list=[train_gpus_per_node] * policy_nodes,
+            use_gpus=True,
+            num_gpus_per_node=train_gpus_per_node,
+            max_colocated_worker_groups=1,
+            port_range_low=cluster_config.get("master_port_range_low"),
+            port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=segment_size,
+            node_resource_constraints=node_resource_constraints,
+        )
+        if node_resource_constraints is not None:
+            train_cluster.get_placement_groups()
+        inference_cluster = None
+        print(
+            f"  ✓ External Dynamo — {policy_nodes} node(s) × "
+            f"{train_gpus_per_node} GPU(s) allocated to training "
+            "(inference served by a DynamoGraphDeployment)",
+            flush=True,
+        )
+
+    elif colocated_inference:
         if total_nodes == 1:
             policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
             assert policy_gpus_per_node > 0, (
@@ -1480,7 +1528,7 @@ def setup(
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
 
     elif backend == "dynamo":
-        # Managed Dynamo owns a fixed worker fleet on the inference virtual cluster.
+        # Config selects a driver-owned Ray fleet or an external DGD.
 
         def init_dynamo():
             t0 = time.perf_counter()

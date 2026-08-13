@@ -460,6 +460,28 @@ class TestCollectiveWeightSynchronizer:
             num_buffers=2,
         )
 
+    @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+    def test_external_generation_world_size_needs_no_inference_cluster(self, mock_ray):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        gen = _mock_generation()
+        gen.get_inference_world_size.return_value = 2
+        sync = CollectiveWeightSynchronizer(
+            policy,
+            gen,
+            _mock_cluster(world_size=1, ip="10.0.0.1", port=29500),
+            None,
+        )
+
+        sync.init_communicator()
+
+        policy.init_collective.assert_called_once_with(
+            "10.0.0.1", 29500, 3, train_world_size=1, nccl_peer="nemo"
+        )
+        gen.init_collective.assert_called_once_with(
+            "10.0.0.1", 29500, 3, train_world_size=1
+        )
+
 
 # ---------------------------------------------------------------------------
 # NcclReshardWeightSynchronizer
@@ -594,6 +616,18 @@ class TestFactory:
             inference_cluster=_mock_cluster(),
         )
         assert isinstance(sync, CollectiveWeightSynchronizer)
+
+    def test_external_dynamo_allows_no_inference_cluster(self):
+        sync = create_weight_synchronizer(
+            policy=_mock_policy(),
+            generation=_mock_generation(),
+            generation_backend=DYNAMO_BACKEND,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=None,
+        )
+        assert isinstance(sync, CollectiveWeightSynchronizer)
+        assert sync._inference_cluster is None
 
     def test_non_colocated_sglang_raises(self):
         policy = _mock_policy()
