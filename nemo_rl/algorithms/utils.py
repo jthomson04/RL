@@ -737,7 +737,14 @@ def print_performance_metrics(
     num_nodes = master_config.cluster["num_nodes"]
     gpus_per_node = master_config.cluster["gpus_per_node"]
     total_num_gpus = num_nodes * gpus_per_node
-    colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    generation_config = master_config.policy["generation"]
+    colocated_inference = generation_config["colocated"]["enabled"]
+    dynamo_config = generation_config.get("dynamo_cfg")
+    external_dynamo = (
+        generation_config.get("backend") == "dynamo"
+        and isinstance(dynamo_config, dict)
+        and "dgd_name" in dynamo_config
+    )
 
     # Idle Time from Training Worker (Async GRPO only)
     if (
@@ -778,6 +785,9 @@ def print_performance_metrics(
     if colocated_inference:
         training_num_gpus = total_num_gpus
         generation_num_gpus = total_num_gpus
+    elif external_dynamo:
+        training_num_gpus = total_num_gpus
+        generation_num_gpus = dynamo_config["engine_world_size"]
     else:
         generation_num_nodes = (
             master_config.policy["generation"]["colocated"]["resources"]["num_nodes"]

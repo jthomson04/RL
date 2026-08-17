@@ -408,6 +408,36 @@ def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
     assert math.isclose(perf["average_token_imbalance"], imbalance, rel_tol=1e-6)
 
 
+def test_external_dynamo_throughput_uses_training_cluster_gpus():
+    master_config = _base_master_config(colocated=False)
+    master_config.cluster = {"num_nodes": 1, "gpus_per_node": 1}
+    master_config.policy["generation"].update(
+        {
+            "backend": "dynamo",
+            "dynamo_cfg": {"dgd_name": "test-dgd", "engine_world_size": 1},
+            "colocated": {
+                "enabled": False,
+                "resources": {"num_nodes": None, "gpus_per_node": None},
+            },
+        }
+    )
+    timing_metrics = {
+        "policy_and_reference_logprobs": 2.0,
+        "policy_training": 4.0,
+        "total_step_time": 10.0,
+        "generation": 5.0,
+        "prepare_for_generation/total": 1.0,
+    }
+    metrics = {"total_num_tokens": 1000.0}
+
+    perf = print_performance_metrics({}, metrics, timing_metrics, master_config)
+
+    assert math.isclose(
+        perf["policy_training_tokens_per_sec_per_gpu"], 250.0, rel_tol=1e-6
+    )
+    assert math.isclose(perf["generation_tokens_per_sec_per_gpu"], 200.0, rel_tol=1e-6)
+
+
 def test_minimal_inputs_no_counts_no_flops(capsys):
     master_config = _base_master_config(colocated=False)
 
