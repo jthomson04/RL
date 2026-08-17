@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prometheus polling lifecycle for managed Dynamo workers."""
+"""Prometheus polling lifecycle for Dynamo workers."""
 
 import logging
 import threading

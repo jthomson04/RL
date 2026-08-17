@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Validated configuration for the managed Dynamo generation backend."""
+"""Validated configuration for managed and external Dynamo generation."""
 
 import warnings
 from typing import Annotated, Any, Literal
@@ -143,6 +143,29 @@ class DynamoCfg(BaseModel, extra="forbid"):
     metrics_exclude_prefixes: list[str] | None
 
 
+class DynamoGraphDeploymentCfg(BaseModel, extra="forbid"):
+    """Externally owned Kubernetes DynamoGraphDeployment configuration.
+
+    nrl-k8s injects dgd_name into the training command after it creates or
+    reuses the deployment. frontend_url is an escape hatch for a reachable
+    nonstandard frontend; NCCL refit still requires dgd_name so the fixed
+    worker fleet can be discovered through GET /health.
+    """
+
+    engine_world_size: PositiveInt
+    dgd_name: str | None
+    frontend_url: str | None
+    namespace: str | None
+    frontend_port: PositiveInt
+    dyn_system_port: PositiveInt
+    request_timeout_s: PositiveFloat
+    discovery_timeout_s: PositiveFloat
+    control_timeout_s: PositiveFloat
+    exclude_tools_when_tool_choice_none: bool
+    metrics_include_prefixes: list[str] | None
+    metrics_exclude_prefixes: list[str] | None
+
+
 class DynamoVllmConfig(BaseModel, extra="allow"):
     """Known vLLM settings consumed by ``dynamo.vllm``.
 
@@ -257,7 +280,7 @@ class DynamoConfig(BaseModel, extra="allow"):
     """Validated boundary for ``policy.generation.backend=dynamo``."""
 
     backend: Literal["dynamo"]
-    dynamo_cfg: DynamoCfg
+    dynamo_cfg: DynamoCfg | DynamoGraphDeploymentCfg
     vllm_cfg: Annotated[
         DynamoVllmConfig, BeforeValidator(_require_nonempty_vllm_config)
     ]
@@ -265,7 +288,9 @@ class DynamoConfig(BaseModel, extra="allow"):
 
     @property
     def engine_world_size(self) -> int:
-        """Return the derived ranks in each single-node vLLM engine."""
+        """Return the ranks in each single-node vLLM engine."""
+        if isinstance(self.dynamo_cfg, DynamoGraphDeploymentCfg):
+            return self.dynamo_cfg.engine_world_size
         return self.vllm_cfg.tensor_parallel_size * self.vllm_cfg.pipeline_parallel_size
 
     @model_validator(mode="after")
@@ -289,13 +314,24 @@ class DynamoConfig(BaseModel, extra="allow"):
         if extra.get("refit_transport") is not None:
             raise ValueError(
                 "policy.generation.refit_transport must be null when "
-                "backend='dynamo'; managed Dynamo supports NCCL collective refit only"
+                "backend='dynamo'; Dynamo supports NCCL collective refit only"
             )
         for quantization_field in ("quant_cfg", "real_quant"):
             if extra.get(quantization_field):
                 raise ValueError(
                     f"policy.generation.{quantization_field} is not supported "
                     "when backend='dynamo'"
+                )
+        if isinstance(self.dynamo_cfg, DynamoGraphDeploymentCfg):
+            configured_world_size = (
+                self.vllm_cfg.tensor_parallel_size
+                * self.vllm_cfg.pipeline_parallel_size
+            )
+            if self.dynamo_cfg.engine_world_size != configured_world_size:
+                raise ValueError(
+                    "policy.generation.dynamo_cfg.engine_world_size must equal "
+                    "vllm_cfg.tensor_parallel_size * "
+                    "vllm_cfg.pipeline_parallel_size"
                 )
         speculative_config = self.vllm_kwargs.get("speculative_config") or (
             self.vllm_cfg.model_extra or {}
@@ -320,7 +356,7 @@ class DynamoConfig(BaseModel, extra="allow"):
                 if value is not None and int(value) != 1:
                     raise ValueError(
                         f"policy.generation.{source}.{field} must be 1 when "
-                        "backend='dynamo'; managed refit rank geometry is TP × PP"
+                        "backend='dynamo'; refit rank geometry is TP × PP"
                     )
         stop_strings = extra.get("stop_strings")
         if stop_strings is not None and len(stop_strings) > 32:

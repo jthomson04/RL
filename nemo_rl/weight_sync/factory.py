@@ -52,7 +52,9 @@ def create_weight_synchronizer(
             "megatron", or "dynamo").
         colocated: Whether policy and generation share the same GPUs.
         train_cluster: RayVirtualCluster for training workers (required for non-colocated).
-        inference_cluster: RayVirtualCluster for inference workers (required for non-colocated).
+        inference_cluster: RayVirtualCluster for inference workers. Required for
+            non-colocated generation except external Dynamo, whose worker world
+            size and endpoints come from its DynamoGraphDeployment.
         refit_buffer_size_gb: Optional fixed buffer size for IPC weight staging.
 
     Returns:
@@ -106,10 +108,14 @@ def create_weight_synchronizer(
             raise NotImplementedError(
                 "SGLang does not support non-colocated inference mode."
             )
-        if train_cluster is None or inference_cluster is None:
+        if train_cluster is None:
             raise ValueError(
-                "train_cluster and inference_cluster are required "
-                "for non-colocated weight synchronization."
+                "train_cluster is required for non-colocated weight synchronization."
+            )
+        if inference_cluster is None and generation_backend != DYNAMO_BACKEND:
+            raise ValueError(
+                "inference_cluster is required for non-colocated weight "
+                "synchronization unless generation_backend='dynamo'."
             )
 
         if generation.cfg.get("refit_transport") == "nccl_reshard":

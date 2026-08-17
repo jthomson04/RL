@@ -43,7 +43,7 @@ from nemo_rl.models.generation.dynamo.arguments import (
     redact_argv,
     redact_environment,
 )
-from nemo_rl.models.generation.dynamo.config import DynamoConfig
+from nemo_rl.models.generation.dynamo.config import DynamoCfg, DynamoConfig
 from nemo_rl.models.generation.dynamo.venv import (
     get_dynamo_executable,
     get_dynamo_python,
@@ -73,7 +73,12 @@ class ManagedDynamoRuntime:
         validated_config = DynamoConfig.model_validate(config)
         self._cluster = cluster
         self._config = validated_config.model_dump()
-        self._dynamo_cfg = validated_config.dynamo_cfg
+        dynamo_cfg = validated_config.dynamo_cfg
+        if not isinstance(dynamo_cfg, DynamoCfg):
+            raise TypeError(
+                "ManagedDynamoRuntime requires driver-owned Dynamo configuration."
+            )
+        self._dynamo_cfg = dynamo_cfg
         self._engine_world_size = validated_config.engine_world_size
         if self._engine_world_size > cluster.num_gpus_per_node:
             raise ValueError(

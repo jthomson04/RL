@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Small HTTP client helpers shared by managed Dynamo components."""
+"""Small HTTP client helpers shared by Dynamo components."""
 
 import json
 import urllib.error

@@ -1,8 +1,15 @@
-# Managed Dynamo generation design
+# Dynamo generation design
 
-The managed Dynamo backend owns a fixed vLLM fleet inside the Ray allocation.
-It is deliberately narrower than Dynamo itself: there is no external-runtime,
-Kubernetes, DGD, multi-node engine-group, or non-vLLM mode.
+The Dynamo backend supports two strict ownership modes selected by the shape of
+`policy.generation.dynamo_cfg`:
+
+- Managed Slurm mode owns a fixed vLLM fleet inside the Ray allocation.
+- Kubernetes mode connects to an externally owned
+  `DynamoGraphDeployment` (DGD).
+
+Both modes share generation, token wrapping, metrics, native vLLM NCCL refit,
+and cache invalidation. Only service discovery, placement, and lifecycle
+ownership differ.
 
 ## Ownership and placement
 
@@ -59,6 +66,104 @@ applies the backport, and records upstream merge commit
 `/opt/dynamo_venv/VLLM_BACKPORTS`. Remove the backport only after Dynamo pins a
 vLLM release containing that fix. At that point delete the patch, application
 logic, marker assertion, and backport text rather than rebasing the patch.
+
+## Kubernetes DGD runtime
+
+The external runtime does not create, scale, or delete serving workers.
+`nrl-k8s` creates or reuses the DGD, waits for the Dynamo operator to report
+it ready, and only then starts the Ray training workload. The Dynamo operator
+and `DynamoGraphDeployment` CRD must already be installed in the target
+cluster.
+
+The strict DGD config shape is:
+
+```yaml
+policy:
+  generation:
+    backend: dynamo
+    dynamo_cfg:
+      engine_world_size: 1
+      dgd_name: my-dgd
+      frontend_url: null
+      namespace: null
+      frontend_port: 8000
+      dyn_system_port: 9090
+      request_timeout_s: 900.0
+      discovery_timeout_s: 15.0
+      control_timeout_s: 600.0
+      exclude_tools_when_tool_choice_none: true
+      metrics_include_prefixes: null
+      metrics_exclude_prefixes: null
+```
+
+The checked-in recipes omit `dgd_name` because their nrl-k8s entrypoints
+inject the concrete deployment name. `frontend_url` is an escape hatch for a
+reachable nonstandard frontend. NCCL refit still requires `dgd_name`, because
+worker discovery uses that deployment's frontend health endpoint. When
+`namespace` is null, NeMo-RL reads the pod's projected service-account
+namespace; it never silently guesses `default`.
+
+The DGD manifest owns the inference engine arguments. Keep
+`engine_world_size` and the recipe's vLLM geometry consistent with the DGD.
+Each vLLM worker must enable the RL routes and native NCCL transfer backend:
+
+```yaml
+args:
+  - --enable-rl
+  - --weight-transfer-config
+  - '{"backend":"nccl"}'
+```
+
+### Fixed worker discovery
+
+The runtime derives
+`http://<dgd>-frontend.<namespace>.svc.cluster.local:<frontend_port>/v1`
+for rollout requests. It reads `GET /health` from the same frontend, filters
+registrations to the deployment namespace plus `component: backend` and
+`endpoint: rl`, deduplicates by `instance_id`, and converts the advertised
+pod address to the worker admin port.
+
+The ordered `(instance_id, system_url)` fleet is frozen at setup. Before
+refit operations the runtime rediscovers membership and fails if any worker
+scaled, restarted, disappeared, or changed address. Restart training after a
+DGD membership change so a new NCCL collective can be established.
+
+If there are `N` workers and each has `engine_world_size = E`:
+
+```text
+inference_world_size = N * E
+world_size = training_world_size + inference_world_size
+worker[i].rank_offset = training_world_size + i * E
+```
+
+The shared `DynamoRefitChannel` performs the same native vLLM transaction
+used by managed mode. The external runtime's shutdown is intentionally a
+no-op; Kubernetes remains the DGD lifecycle owner.
+
+### nrl-k8s RayJob ordering and cleanup
+
+For ephemeral runs, nrl-k8s creates the RayJob with `spec.suspend: true` and
+waits for `jobDeploymentStatus: Suspended`. It creates the DGD and DRA
+prerequisites with the RayJob as their garbage-collection owner, waits for the
+DGD's current generation to report `Ready=True`, and then resumes the
+RayJob.
+
+After KubeRay reports the generated RayCluster, nrl-k8s reparents only
+resources created for this run to that RayCluster. Reused DGDs and DRA
+resources are never adopted. If reparenting fails, the RayJob owner remains as
+a TTL-based cleanup fallback.
+
+The four GB300 examples are under `infra/nrl_k8s/examples/dynamo/`. Validate
+and render any recipe/infra pair before launching:
+
+```bash
+RECIPE=infra/nrl_k8s/examples/dynamo/V1/grpo_math_1b_dynamo_nccl.yaml
+INFRA=infra/nrl_k8s/examples/dynamo/V1/grpo_math_1b_dynamo_nccl.gb300.infra.yaml
+
+nrl-k8s check "$RECIPE" --infra "$INFRA"
+nrl-k8s run "$RECIPE" --infra "$INFRA" --rayjob --dry-run
+nrl-k8s run "$RECIPE" --infra "$INFRA" --rayjob --no-wait
+```
 
 See [Managed Dynamo generation on Slurm](../guides/dynamo-generation.md) for
 build, configuration, and launch instructions.

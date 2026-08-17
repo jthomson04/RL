@@ -48,7 +48,8 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         generation: Generation object implementing GenerationInterface.
         train_cluster: RayVirtualCluster for the training workers, used to
             obtain the master address/port and world size for collective init.
-        inference_cluster: RayVirtualCluster for the inference workers.
+        inference_cluster: RayVirtualCluster for inference workers, or None when
+            the generation backend reports its external worker world size.
     """
 
     def __init__(
@@ -56,7 +57,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         policy: Any,
         generation: Any,
         train_cluster: Any,
-        inference_cluster: Any,
+        inference_cluster: Optional[Any],
     ):
         self._policy = policy
         self._generation = generation
@@ -115,6 +116,11 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         train_world_size = self._train_cluster.world_size()
         inference_world_size = self._generation.get_inference_world_size()
         if inference_world_size is None:
+            if self._inference_cluster is None:
+                raise RuntimeError(
+                    "Generation must report inference world size when no "
+                    "inference cluster is available."
+                )
             inference_world_size = self._inference_cluster.world_size()
         world_size = train_world_size + inference_world_size
 

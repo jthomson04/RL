@@ -35,6 +35,7 @@ from nemo_rl.models.generation.dynamo.arguments import (
 from nemo_rl.models.generation.dynamo.config import (
     VLLM_PACKED_BUFFER_SIZE_BYTES,
     VLLM_PACKED_NUM_BUFFERS,
+    DynamoCfg,
     DynamoConfig,
 )
 from nemo_rl.models.generation.dynamo.venv import (
@@ -135,6 +136,10 @@ class DynamoVllmWorker:  # pragma: no cover
 
         validated_config = DynamoConfig.model_validate(config)
         dynamo_cfg = validated_config.dynamo_cfg
+        if not isinstance(dynamo_cfg, DynamoCfg):
+            raise TypeError(
+                "DynamoVllmWorker requires driver-owned Dynamo configuration."
+            )
         dynamo_python = get_dynamo_python()
         dynamo_venv = str(get_dynamo_venv_dir())
         vllm_cfg = validated_config.vllm_cfg.model_dump()

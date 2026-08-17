@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NCCL refit protocol for a fixed managed Dynamo worker fleet."""
+"""NCCL refit protocol for a fixed Dynamo worker fleet."""
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -137,7 +137,7 @@ class DynamoRefitChannel:
         endpoints = tuple(DynamoWorkerEndpoint.from_metadata(item) for item in current)
         if endpoints != self._workers:
             raise RuntimeError(
-                "Managed Dynamo worker membership changed after collective setup"
+                "Dynamo worker membership changed after collective setup"
             )
         return endpoints
 
