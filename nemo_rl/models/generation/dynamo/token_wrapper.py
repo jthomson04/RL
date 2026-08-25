@@ -21,6 +21,8 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from typing import Any, Optional
 
+import orjson
+
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH,
     DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW,
@@ -40,6 +42,8 @@ _TOOL_ARGUMENT_MAPPING_ERROR = "Can only get item pairs from a mapping."
 def _coerce_token_id_list(value: Any, field_name: str) -> list[int]:
     if not isinstance(value, list):
         raise ValueError(f"{field_name} must be a list of token IDs.")
+    if all(type(token_id) is int for token_id in value):
+        return value
     try:
         return [int(token_id) for token_id in value]
     except (TypeError, ValueError) as e:
@@ -47,11 +51,15 @@ def _coerce_token_id_list(value: Any, field_name: str) -> list[int]:
 
 
 def _strip_gym_token_metadata(messages: list[Any]) -> list[Any]:
-    stripped_messages = deepcopy(messages)
-    for message in stripped_messages:
-        if isinstance(message, dict):
-            for field in _GYM_TOKEN_METADATA_FIELDS:
-                message.pop(field, None)
+    stripped_messages: list[Any] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            stripped_messages.append(message)
+            continue
+        stripped_message = dict(message)
+        for field in _GYM_TOKEN_METADATA_FIELDS:
+            stripped_message.pop(field, None)
+        stripped_messages.append(stripped_message)
     return stripped_messages
 
 
@@ -137,9 +145,9 @@ def _render_prompt_token_ids(
     if isinstance(token_ids, list) and (
         not token_ids or not isinstance(token_ids[0], list)
     ):
-        return _coerce_token_id_list(token_ids, "prompt token IDs")
+        return token_ids
     if isinstance(token_ids, list) and len(token_ids) == 1:
-        return _coerce_token_id_list(token_ids[0], "prompt token IDs")
+        return token_ids[0]
     raise ValueError(
         "Dynamo token wrapper expected chat template rendering to return one "
         "list of prompt token IDs."
@@ -248,7 +256,7 @@ def prepare_dynamo_chat_completion_request(
     if not isinstance(messages, list):
         raise ValueError("Dynamo token wrapper requires chat-completion messages.")
 
-    prepared_body = deepcopy(request_body)
+    prepared_body = dict(request_body)
     stripped_messages = _strip_gym_token_metadata(messages)
     prepared_body["messages"] = stripped_messages
     required_prefix_value = prepared_body.pop("required_prefix_token_ids", None)
@@ -262,7 +270,7 @@ def prepare_dynamo_chat_completion_request(
     )
 
     add_generation_prompt = _request_add_generation_prompt(prepared_body)
-    template_messages = deepcopy(stripped_messages)
+    template_messages = stripped_messages
     assistant_index = _latest_tokenized_assistant_index(messages)
     if assistant_index is not None and not required_prefix_token_ids:
         raise ValueError(
@@ -291,6 +299,7 @@ def prepare_dynamo_chat_completion_request(
     except TypeError as e:
         if str(e) != _TOOL_ARGUMENT_MAPPING_ERROR:
             raise
+        template_messages = deepcopy(stripped_messages)
         _normalize_tool_arguments_for_template(
             template_messages, before_index=len(template_messages)
         )
@@ -332,6 +341,26 @@ def prepare_dynamo_chat_completion_request(
     return prepared_body
 
 
+def _prepare_serialized_dynamo_chat_completion_request(
+    request_body: bytes,
+    *,
+    tokenizer: Any,
+    tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
+    exclude_tools_when_tool_choice_none: bool,
+) -> bytes:
+    """Parse, prepare, and serialize one Dynamo chat-completion request."""
+    parsed_body = orjson.loads(request_body)
+    if not isinstance(parsed_body, dict):
+        raise ValueError("Chat completion body must be a JSON object.")
+    prepared_body = prepare_dynamo_chat_completion_request(
+        parsed_body,
+        tokenizer=tokenizer,
+        tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+        exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
+    )
+    return orjson.dumps(prepared_body)
+
+
 class DynamoTokenWrapperServer:
     """Small HTTP server that supplies tokenized chat prompts to Dynamo."""
 
@@ -358,8 +387,8 @@ class DynamoTokenWrapperServer:
         """Start the wrapper in a background uvicorn thread."""
         import aiohttp
         import uvicorn
-        from fastapi import FastAPI, HTTPException, Request
-        from fastapi.responses import JSONResponse
+        from fastapi import FastAPI, Request
+        from fastapi.responses import Response
 
         @asynccontextmanager
         async def lifespan(_: FastAPI):
@@ -390,33 +419,37 @@ class DynamoTokenWrapperServer:
             }
 
         @app.post("/v1/chat/completions")
-        async def chat_completions(request: Request) -> JSONResponse:
-            try:
-                request_body = await request.json()
-            except json.JSONDecodeError as e:
-                raise HTTPException(status_code=400, detail="Invalid JSON body.") from e
-            if not isinstance(request_body, dict):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Chat completion body must be a JSON object.",
-                )
-
+        async def chat_completions(request: Request) -> Response:
             try:
                 prepared_body = await asyncio.to_thread(
-                    prepare_dynamo_chat_completion_request,
-                    request_body,
+                    _prepare_serialized_dynamo_chat_completion_request,
+                    await request.body(),
                     tokenizer=self.tokenizer,
                     tokenizer_chat_template_kwargs=self.tokenizer_chat_template_kwargs,
                     exclude_tools_when_tool_choice_none=self.exclude_tools_when_tool_choice_none,
                 )
+            except orjson.JSONDecodeError:
+                return Response(
+                    content=orjson.dumps({"detail": "Invalid JSON body."}),
+                    status_code=400,
+                    media_type="application/json",
+                )
             except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e)) from e
+                return Response(
+                    content=orjson.dumps({"detail": str(e)}),
+                    status_code=400,
+                    media_type="application/json",
+                )
 
             status_code, response_body = await self._forward_chat_completion(
                 prepared_body,
                 authorization=request.headers.get("authorization"),
             )
-            return JSONResponse(content=response_body, status_code=status_code)
+            return Response(
+                content=response_body,
+                status_code=status_code,
+                media_type="application/json",
+            )
 
         node_ip = _get_node_ip_local()
         free_port = _get_free_port_local(
@@ -442,10 +475,10 @@ class DynamoTokenWrapperServer:
 
     async def _forward_chat_completion(
         self,
-        request_body: dict[str, Any],
+        request_body: bytes,
         *,
         authorization: Optional[str],
-    ) -> tuple[int, dict[str, Any]]:
+    ) -> tuple[int, bytes]:
         import aiohttp
 
         url = f"{self.dynamo_frontend_base_url.rstrip('/')}/chat/completions"
@@ -455,31 +488,31 @@ class DynamoTokenWrapperServer:
 
         session = self._client_session
         if session is None:
-            return 503, {"error": {"message": "Dynamo token wrapper is not ready."}}
+            return 503, orjson.dumps(
+                {"error": {"message": "Dynamo token wrapper is not ready."}}
+            )
         try:
             async with session.post(
                 url,
-                json=request_body,
+                data=request_body,
                 headers=headers,
             ) as response:
-                response_text = await response.text()
-                if not response_text:
-                    return response.status, {}
-                try:
-                    response_body = json.loads(response_text)
-                except json.JSONDecodeError:
-                    response_body = {"raw": response_text}
-                if not isinstance(response_body, dict):
-                    response_body = {"response": response_body}
-                return response.status, response_body
+                return response.status, await response.read()
         except asyncio.TimeoutError:
-            return 504, {"error": {"message": f"Timed out forwarding to {url}."}}
+            return 504, orjson.dumps(
+                {"error": {"message": f"Timed out forwarding to {url}."}}
+            )
         except aiohttp.ClientError as e:
-            return 502, {
-                "error": {
-                    "message": f"Failed to forward request to {url}: {type(e).__name__}: {e}"
+            return 502, orjson.dumps(
+                {
+                    "error": {
+                        "message": (
+                            f"Failed to forward request to {url}: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                    }
                 }
-            }
+            )
 
     def shutdown(self) -> None:
         """Stop the background uvicorn server."""

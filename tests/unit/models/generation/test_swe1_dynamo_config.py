@@ -41,6 +41,7 @@ def test_public_swe_recipe_has_supported_topology_and_telemetry(
     assert config["policy"]["model_name"] == (
         "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
     )
+    assert config["policy"]["tokenizer"]["use_fastokens"] is True
     assert config["cluster"]["gpus_per_node"] == 8
     assert config["cluster"]["num_nodes"] == 3
     assert config["cluster"]["segment_size"] == 1

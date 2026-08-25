@@ -46,6 +46,7 @@ policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   tokenizer:
     name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    use_fastokens: true
     chat_template_kwargs:
       enable_thinking: true
   hf_config_overrides: {}

@@ -13,13 +13,17 @@
 # limitations under the License.
 
 import asyncio
-import json
+from copy import deepcopy
 
+import orjson
 import pytest
 from transformers import AutoTokenizer
 
 from nemo_rl.models.generation.dynamo.token_wrapper import (
     DynamoTokenWrapperServer,
+    _coerce_token_id_list,
+    _prepare_serialized_dynamo_chat_completion_request,
+    _render_prompt_token_ids,
     prepare_dynamo_chat_completion_request,
 )
 
@@ -131,6 +135,36 @@ TOOLS = [
         },
     }
 ]
+
+
+def test_native_token_id_lists_are_reused() -> None:
+    token_ids = [1, 2, 3]
+
+    assert _coerce_token_id_list(token_ids, "test tokens") is token_ids
+    assert _coerce_token_id_list(["1", 2.0, True], "test tokens") == [1, 2, 1]
+
+
+def test_trusted_tokenizer_output_is_reused() -> None:
+    class _TrustedTokenizer(_Tokenizer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.token_ids = [10, 20, 30]
+
+        def apply_chat_template(self, *args, **kwargs):
+            return self.token_ids
+
+    tokenizer = _TrustedTokenizer()
+
+    result = _render_prompt_token_ids(
+        tokenizer=tokenizer,
+        request_body={},
+        messages=[{"role": "user", "content": "hello"}],
+        tokenizer_chat_template_kwargs=None,
+        exclude_tools_when_tool_choice_none=True,
+        add_generation_prompt=True,
+    )
+
+    assert result is tokenizer.token_ids
 
 
 def _tool_conversation() -> list[dict]:
@@ -507,6 +541,7 @@ def test_prepare_dynamo_chat_completion_request_normalizes_prior_tool_arguments(
             {"role": "user", "content": "next"},
         ],
     }
+    original_body = deepcopy(body)
 
     prepared = prepare_dynamo_chat_completion_request(
         body,
@@ -521,6 +556,7 @@ def test_prepare_dynamo_chat_completion_request_normalizes_prior_tool_arguments(
     assert prepared["messages"][1]["tool_calls"][1]["function"]["arguments"] == (
         "not-json"
     )
+    assert body == original_body
 
 
 def test_prepare_dynamo_chat_completion_request_normalizes_tools_without_prefix() -> (
@@ -578,17 +614,42 @@ def test_prepare_dynamo_chat_completion_request_rejects_multiple_choices() -> No
         )
 
 
+def test_prepare_serialized_dynamo_chat_completion_request_uses_bytes() -> None:
+    request_body = orjson.dumps(
+        {
+            "model": "dummy-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    )
+
+    prepared_body = _prepare_serialized_dynamo_chat_completion_request(
+        request_body,
+        tokenizer=_Tokenizer(),
+        tokenizer_chat_template_kwargs=None,
+        exclude_tools_when_tool_choice_none=True,
+    )
+
+    assert isinstance(prepared_body, bytes)
+    assert orjson.loads(prepared_body)["nvext"]["token_data"] == [10, 99]
+
+    with pytest.raises(orjson.JSONDecodeError):
+        _prepare_serialized_dynamo_chat_completion_request(
+            b"not-json",
+            tokenizer=_Tokenizer(),
+            tokenizer_chat_template_kwargs=None,
+            exclude_tools_when_tool_choice_none=True,
+        )
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        _prepare_serialized_dynamo_chat_completion_request(
+            b"[]",
+            tokenizer=_Tokenizer(),
+            tokenizer_chat_template_kwargs=None,
+            exclude_tools_when_tool_choice_none=True,
+        )
+
+
 def test_forward_chat_completion_reuses_loop_bound_session() -> None:
-    raw_response = {
-        "choices": [{"message": {"role": "assistant", "content": "answer"}}],
-        "nvext": {
-            "engine_data": {
-                "prompt_token_ids": [1, 2],
-                "completion_token_ids": [3],
-                "completion_logprobs": [-0.25],
-            }
-        },
-    }
+    raw_response = b'{ "choices": [], "nvext": {"engine_data": {}} }\n'
 
     class FakeResponse:
         status = 200
@@ -599,15 +660,15 @@ def test_forward_chat_completion_reuses_loop_bound_session() -> None:
         async def __aexit__(self, *args):
             return None
 
-        async def text(self):
-            return json.dumps(raw_response)
+        async def read(self):
+            return raw_response
 
     class FakeSession:
         def __init__(self):
             self.calls = []
 
-        def post(self, url, *, json, headers):
-            self.calls.append((url, json, headers))
+        def post(self, url, *, data, headers):
+            self.calls.append((url, data, headers))
             return FakeResponse()
 
     server = DynamoTokenWrapperServer(
@@ -621,13 +682,36 @@ def test_forward_chat_completion_reuses_loop_bound_session() -> None:
     server._client_session = session
 
     async def forward_twice():
-        first = await server._forward_chat_completion({}, authorization=None)
-        second = await server._forward_chat_completion({}, authorization="Bearer token")
+        first = await server._forward_chat_completion(b"first", authorization=None)
+        second = await server._forward_chat_completion(
+            b"second", authorization="Bearer token"
+        )
         return first, second
 
     first, second = asyncio.run(forward_twice())
 
     assert len(session.calls) == 2
+    assert session.calls[0][1] == b"first"
+    assert session.calls[1][1] == b"second"
     assert session.calls[1][2]["Authorization"] == "Bearer token"
     assert first == (200, raw_response)
     assert second == (200, raw_response)
+
+
+def test_forward_chat_completion_serializes_wrapper_owned_error() -> None:
+    server = DynamoTokenWrapperServer(
+        dynamo_frontend_base_url="http://dynamo/v1",
+        tokenizer=_Tokenizer(),
+        tokenizer_chat_template_kwargs=None,
+        exclude_tools_when_tool_choice_none=True,
+        request_timeout_s=30,
+    )
+
+    status_code, response_body = asyncio.run(
+        server._forward_chat_completion(b"{}", authorization=None)
+    )
+
+    assert status_code == 503
+    assert orjson.loads(response_body) == {
+        "error": {"message": "Dynamo token wrapper is not ready."}
+    }
