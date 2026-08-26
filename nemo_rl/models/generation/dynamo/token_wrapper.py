@@ -16,7 +16,9 @@
 
 import asyncio
 import json
+import multiprocessing
 import threading
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from typing import Any, Optional
@@ -37,6 +39,11 @@ _GYM_TOKEN_METADATA_FIELDS = (
     "generation_log_probs",
 )
 _TOOL_ARGUMENT_MAPPING_ERROR = "Can only get item pairs from a mapping."
+_REQUEST_PROCESS_START_TIMEOUT_S = 60
+
+_request_worker_tokenizer: Any = None
+_request_worker_tokenizer_chat_template_kwargs: Optional[dict[str, Any]] = None
+_request_worker_exclude_tools_when_tool_choice_none: Optional[bool] = None
 
 
 def _coerce_token_id_list(value: Any, field_name: str) -> list[int]:
@@ -361,6 +368,50 @@ def _prepare_serialized_dynamo_chat_completion_request(
     return orjson.dumps(prepared_body)
 
 
+def _initialize_request_worker(
+    tokenizer: Any,
+    tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
+    exclude_tools_when_tool_choice_none: bool,
+    startup_barrier: Any,
+) -> None:
+    """Initialize one spawned request-preparation worker."""
+    global _request_worker_tokenizer
+    global _request_worker_tokenizer_chat_template_kwargs
+    global _request_worker_exclude_tools_when_tool_choice_none
+
+    _request_worker_tokenizer = tokenizer
+    _request_worker_tokenizer_chat_template_kwargs = tokenizer_chat_template_kwargs
+    _request_worker_exclude_tools_when_tool_choice_none = (
+        exclude_tools_when_tool_choice_none
+    )
+    startup_barrier.wait()
+
+
+def _prepare_serialized_request_in_worker(request_body: bytes) -> bytes:
+    """Prepare one request with process-local tokenizer state."""
+    if _request_worker_tokenizer is None:
+        raise RuntimeError("Dynamo token wrapper request worker is not initialized.")
+    if _request_worker_exclude_tools_when_tool_choice_none is None:
+        raise RuntimeError("Dynamo token wrapper request worker is not initialized.")
+    return _prepare_serialized_dynamo_chat_completion_request(
+        request_body,
+        tokenizer=_request_worker_tokenizer,
+        tokenizer_chat_template_kwargs=(
+            _request_worker_tokenizer_chat_template_kwargs
+        ),
+        exclude_tools_when_tool_choice_none=(
+            _request_worker_exclude_tools_when_tool_choice_none
+        ),
+    )
+
+
+def _request_worker_ready() -> bool:
+    """Return after the request worker initializer has completed."""
+    if _request_worker_tokenizer is None:
+        raise RuntimeError("Dynamo token wrapper request worker is not initialized.")
+    return True
+
+
 class DynamoTokenWrapperServer:
     """Small HTTP server that supplies tokenized chat prompts to Dynamo."""
 
@@ -372,16 +423,79 @@ class DynamoTokenWrapperServer:
         tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
         exclude_tools_when_tool_choice_none: bool,
         request_timeout_s: Optional[float],
+        request_processes: int,
     ) -> None:
         self.dynamo_frontend_base_url = dynamo_frontend_base_url
         self.tokenizer = tokenizer
         self.tokenizer_chat_template_kwargs = tokenizer_chat_template_kwargs
         self.exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
         self.request_timeout_s = request_timeout_s
+        self.request_processes = request_processes
         self.base_url: Optional[str] = None
         self.server: Any = None
         self.thread: Optional[threading.Thread] = None
         self._client_session: Any = None
+        self._request_executor: Optional[ProcessPoolExecutor] = None
+        self._active_request_preparations = 0
+
+    def _start_request_executor(self) -> None:
+        if self.request_processes == 1:
+            return
+
+        context = multiprocessing.get_context("spawn")
+        startup_barrier = context.Barrier(
+            self.request_processes,
+            timeout=_REQUEST_PROCESS_START_TIMEOUT_S,
+        )
+        executor = ProcessPoolExecutor(
+            max_workers=self.request_processes,
+            mp_context=context,
+            initializer=_initialize_request_worker,
+            initargs=(
+                self.tokenizer,
+                self.tokenizer_chat_template_kwargs,
+                self.exclude_tools_when_tool_choice_none,
+                startup_barrier,
+            ),
+        )
+        started = False
+        try:
+            futures = [
+                executor.submit(_request_worker_ready)
+                for _ in range(self.request_processes)
+            ]
+            for future in futures:
+                future.result(timeout=_REQUEST_PROCESS_START_TIMEOUT_S)
+            started = True
+        finally:
+            if not started:
+                executor.shutdown(wait=True, cancel_futures=True)
+        self._request_executor = executor
+
+    async def _prepare_request_body(self, request_body: bytes) -> bytes:
+        executor = self._request_executor
+        use_in_process_path = executor is None or self._active_request_preparations == 0
+        self._active_request_preparations += 1
+        try:
+            if use_in_process_path:
+                return await asyncio.to_thread(
+                    _prepare_serialized_dynamo_chat_completion_request,
+                    request_body,
+                    tokenizer=self.tokenizer,
+                    tokenizer_chat_template_kwargs=(
+                        self.tokenizer_chat_template_kwargs
+                    ),
+                    exclude_tools_when_tool_choice_none=(
+                        self.exclude_tools_when_tool_choice_none
+                    ),
+                )
+            return await asyncio.get_running_loop().run_in_executor(
+                executor,
+                _prepare_serialized_request_in_worker,
+                request_body,
+            )
+        finally:
+            self._active_request_preparations -= 1
 
     def start(self) -> str:
         """Start the wrapper in a background uvicorn thread."""
@@ -389,6 +503,8 @@ class DynamoTokenWrapperServer:
         import uvicorn
         from fastapi import FastAPI, Request
         from fastapi.responses import Response
+
+        self._start_request_executor()
 
         @asynccontextmanager
         async def lifespan(_: FastAPI):
@@ -421,13 +537,7 @@ class DynamoTokenWrapperServer:
         @app.post("/v1/chat/completions")
         async def chat_completions(request: Request) -> Response:
             try:
-                prepared_body = await asyncio.to_thread(
-                    _prepare_serialized_dynamo_chat_completion_request,
-                    await request.body(),
-                    tokenizer=self.tokenizer,
-                    tokenizer_chat_template_kwargs=self.tokenizer_chat_template_kwargs,
-                    exclude_tools_when_tool_choice_none=self.exclude_tools_when_tool_choice_none,
-                )
+                prepared_body = await self._prepare_request_body(await request.body())
             except orjson.JSONDecodeError:
                 return Response(
                     content=orjson.dumps({"detail": "Invalid JSON body."}),
@@ -520,3 +630,7 @@ class DynamoTokenWrapperServer:
             self.server.should_exit = True
         if self.thread is not None:
             self.thread.join(timeout=10)
+        request_executor = self._request_executor
+        self._request_executor = None
+        if request_executor is not None:
+            request_executor.shutdown(wait=True, cancel_futures=True)

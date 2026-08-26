@@ -137,6 +137,7 @@ class DynamoCfg(BaseModel, extra="forbid"):
     startup_timeout_s: PositiveFloat
     request_timeout_s: PositiveFloat
     control_timeout_s: PositiveFloat
+    token_wrapper_request_processes: PositiveInt = 1
     worker_args: DynamoWorkerArgs
     frontend_args: DynamoFrontendArgs
     metrics_include_prefixes: list[str] | None

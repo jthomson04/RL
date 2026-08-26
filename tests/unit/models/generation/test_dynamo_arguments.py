@@ -95,7 +95,18 @@ def _flag_value(argv: list[str], flag: str) -> str:
 
 
 def test_config_derives_world_size_and_rejects_removed_public_fields() -> None:
-    assert DynamoConfig.model_validate(_config()).engine_world_size == 2
+    validated = DynamoConfig.model_validate(_config())
+    assert validated.engine_world_size == 2
+    assert validated.dynamo_cfg.token_wrapper_request_processes == 1
+
+    invalid_processes = _config()
+    invalid_processes["dynamo_cfg"]["token_wrapper_request_processes"] = 0
+    with pytest.raises(
+        ValidationError,
+        match="token_wrapper_request_processes",
+    ):
+        DynamoConfig.model_validate(invalid_processes)
+
     for field in ("engine_world_size", "namespace", "dynamo_python", "etcd_port"):
         with pytest.raises(ValidationError, match=field):
             DynamoConfig.model_validate(

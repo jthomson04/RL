@@ -19,6 +19,7 @@ import orjson
 import pytest
 from transformers import AutoTokenizer
 
+from nemo_rl.models.generation.dynamo import token_wrapper as token_wrapper_module
 from nemo_rl.models.generation.dynamo.token_wrapper import (
     DynamoTokenWrapperServer,
     _coerce_token_id_list,
@@ -677,6 +678,7 @@ def test_forward_chat_completion_reuses_loop_bound_session() -> None:
         tokenizer_chat_template_kwargs=None,
         exclude_tools_when_tool_choice_none=True,
         request_timeout_s=30,
+        request_processes=1,
     )
     session = FakeSession()
     server._client_session = session
@@ -705,6 +707,7 @@ def test_forward_chat_completion_serializes_wrapper_owned_error() -> None:
         tokenizer_chat_template_kwargs=None,
         exclude_tools_when_tool_choice_none=True,
         request_timeout_s=30,
+        request_processes=1,
     )
 
     status_code, response_body = asyncio.run(
@@ -715,3 +718,110 @@ def test_forward_chat_completion_serializes_wrapper_owned_error() -> None:
     assert orjson.loads(response_body) == {
         "error": {"message": "Dynamo token wrapper is not ready."}
     }
+
+
+def test_single_process_request_path_does_not_create_executor() -> None:
+    server = DynamoTokenWrapperServer(
+        dynamo_frontend_base_url="http://dynamo/v1",
+        tokenizer=_Tokenizer(),
+        tokenizer_chat_template_kwargs=None,
+        exclude_tools_when_tool_choice_none=True,
+        request_timeout_s=30,
+        request_processes=1,
+    )
+
+    server._start_request_executor()
+    prepared = asyncio.run(
+        server._prepare_request_body(
+            orjson.dumps(
+                {
+                    "model": "dummy-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                }
+            )
+        )
+    )
+
+    assert server._request_executor is None
+    assert orjson.loads(prepared)["nvext"]["token_data"] == [10, 99]
+
+
+def test_spawned_request_workers_preserve_bytes_and_errors() -> None:
+    tokenizer = _Tokenizer()
+    server = DynamoTokenWrapperServer(
+        dynamo_frontend_base_url="http://dynamo/v1",
+        tokenizer=tokenizer,
+        tokenizer_chat_template_kwargs=None,
+        exclude_tools_when_tool_choice_none=True,
+        request_timeout_s=30,
+        request_processes=2,
+    )
+    request_body = orjson.dumps(
+        {
+            "model": "dummy-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    )
+
+    server._start_request_executor()
+
+    async def prepare_in_worker(body: bytes) -> bytes:
+        assert server._request_executor is not None
+        return await asyncio.get_running_loop().run_in_executor(
+            server._request_executor,
+            token_wrapper_module._prepare_serialized_request_in_worker,
+            body,
+        )
+
+    try:
+        prepared = asyncio.run(prepare_in_worker(request_body))
+        with pytest.raises(orjson.JSONDecodeError):
+            asyncio.run(prepare_in_worker(b"not-json"))
+
+        fast_lane_prepared = asyncio.run(server._prepare_request_body(request_body))
+    finally:
+        server.shutdown()
+
+    assert isinstance(prepared, bytes)
+    assert orjson.loads(prepared)["nvext"]["token_data"] == [10, 99]
+    assert fast_lane_prepared == prepared
+    assert tokenizer.calls
+    assert server._request_executor is None
+
+
+def test_request_worker_startup_failure_cleans_up_executor(monkeypatch) -> None:
+    shutdown_calls = []
+
+    class FailedFuture:
+        def result(self, timeout):
+            raise RuntimeError("worker failed")
+
+    class FailedExecutor:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def submit(self, function):
+            return FailedFuture()
+
+        def shutdown(self, *, wait, cancel_futures):
+            shutdown_calls.append((wait, cancel_futures))
+
+    monkeypatch.setattr(
+        token_wrapper_module,
+        "ProcessPoolExecutor",
+        FailedExecutor,
+    )
+    server = DynamoTokenWrapperServer(
+        dynamo_frontend_base_url="http://dynamo/v1",
+        tokenizer=_Tokenizer(),
+        tokenizer_chat_template_kwargs=None,
+        exclude_tools_when_tool_choice_none=True,
+        request_timeout_s=30,
+        request_processes=2,
+    )
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        server._start_request_executor()
+
+    assert shutdown_calls == [(True, True)]
+    assert server._request_executor is None
