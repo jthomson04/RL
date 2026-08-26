@@ -207,6 +207,7 @@ class DynamoGeneration(GenerationInterface):
                         dynamo_cfg.worker_args.exclude_tools_when_tool_choice_none
                     ),
                     request_timeout_s=dynamo_cfg.request_timeout_s,
+                    request_processes=dynamo_cfg.token_wrapper_request_processes,
                 )
                 wrapper_url = self._token_wrapper_server.start()
                 self.dp_openai_server_base_urls = [wrapper_url]

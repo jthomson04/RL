@@ -41,6 +41,7 @@ def test_public_swe_recipe_has_supported_topology_and_telemetry(
     assert config["policy"]["model_name"] == (
         "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
     )
+    assert config["policy"]["tokenizer"]["use_fastokens"] is True
     assert config["cluster"]["gpus_per_node"] == 8
     assert config["cluster"]["num_nodes"] == 3
     assert config["cluster"]["segment_size"] == 1
@@ -58,6 +59,7 @@ def test_public_swe_recipe_has_supported_topology_and_telemetry(
     assert generation["vllm_cfg"]["expert_parallel_size"] == 4
     assert validated.dynamo_cfg.frontend_args.router_mode == "kv"
     assert validated.dynamo_cfg.control_timeout_s == 600
+    assert validated.dynamo_cfg.token_wrapper_request_processes == 8
     assert validated.vllm_cfg.enable_vllm_metrics_logger is True
     assert validated.vllm_cfg.load_format == "dummy"
     assert config["env"]["nemo_gym"]["config_paths"][-1].endswith(

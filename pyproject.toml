@@ -106,6 +106,7 @@ dependencies = [
   # so the marker must include aarch64 — otherwise mooncake is silently
   # excluded from the resolution during the Docker build.
   "mooncake-transfer-engine-cuda13==0.3.11.post1 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "orjson>=3.11.6",
 ]
 
 [project.optional-dependencies]

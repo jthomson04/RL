@@ -46,6 +46,7 @@ policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   tokenizer:
     name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    use_fastokens: true
     chat_template_kwargs:
       enable_thinking: true
   hf_config_overrides: {}
@@ -90,6 +91,7 @@ policy:
       startup_timeout_s: 1800
       request_timeout_s: 7200
       control_timeout_s: 600
+      token_wrapper_request_processes: 8
       metrics_include_prefixes: null
       metrics_exclude_prefixes: null
       worker_args:

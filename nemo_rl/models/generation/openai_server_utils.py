@@ -108,12 +108,16 @@ def replace_prefix_tokens(
     count_needed = template_prefix_token_ids.count(eos_token_id)
     count_seen = 0
     template_cut_start = -1
-    for pos, tid in enumerate(template_token_ids):
-        if tid == eos_token_id:
-            count_seen += 1
-            if count_seen == count_needed:
-                template_cut_start = pos
-                break
+    search_start = 0
+    for _ in range(count_needed):
+        try:
+            template_cut_start = template_token_ids.index(
+                eos_token_id, search_start
+            )
+        except ValueError:
+            break
+        count_seen += 1
+        search_start = template_cut_start + 1
 
     assert template_cut_start >= 0, (
         f"EOS token #{count_needed} not found in template_token_ids "

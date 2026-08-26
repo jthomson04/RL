@@ -262,6 +262,7 @@ def test_token_wrapper_is_used_for_nemo_gym(monkeypatch) -> None:
     )
     assert generation.dp_openai_server_base_urls == ["http://127.0.0.1:3001/v1"]
     assert wrappers[0].kwargs["tokenizer"] is tokenizer
+    assert wrappers[0].kwargs["request_processes"] == 1
 
 
 def test_refit_rank_offsets_update_and_pickled_cache_invalidation(monkeypatch) -> None:
