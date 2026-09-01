@@ -1141,9 +1141,9 @@ def setup(
                     inference_cluster, policy_config
                 )
             elif generation_config["backend"] == "dynamo":
-                # Managed Dynamo creates one single-node engine per placement
-                # group and does not need a backend-specific PG strategy.
-                inference_cluster.get_placement_groups()
+                DynamoGeneration.init_cluster_placement_groups(
+                    inference_cluster, generation_config
+                )
             else:
                 {
                     "vllm": VllmGeneration,

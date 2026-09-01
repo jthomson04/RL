@@ -23,8 +23,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from nemo_rl.models.generation.dynamo.dynamo_worker import (
+    DynamoDistributedLaunch,
     DynamoGpuReservation,
     DynamoVllmWorker,
+    _add_distributed_launch_args,
 )
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     ManagedDynamoRuntime,
@@ -33,6 +35,7 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
 from nemo_rl.models.generation.dynamo.venv import get_dynamo_venv_dir
 from nemo_rl.models.generation.dynamo.worker_pool import (
     FixedDynamoWorkerPool,
+    _group_engine_ranks_by_node,
     _kv_event_port_for_node_slot,
     _nixl_port_for_node_slot,
     _vllm_port_for_node_slot,
@@ -178,9 +181,19 @@ def test_runtime_construction_is_inert_and_namespace_is_driver_owned(
         _ = runtime.frontend_url
 
 
-def test_runtime_rejects_multinode_engine_group_before_spawning() -> None:
-    with pytest.raises(ValueError, match="fit on one node"):
-        ManagedDynamoRuntime(cluster=_Cluster(), config=_config(tp=8))
+def test_runtime_accepts_even_multinode_engine_and_rejects_uneven_split() -> None:
+    class MultinodeCluster:
+        num_gpus_per_node = 4
+
+        @staticmethod
+        def world_size() -> int:
+            return 8
+
+    runtime = ManagedDynamoRuntime(cluster=MultinodeCluster(), config=_config(tp=8))
+    assert runtime._engine_world_size == 8
+
+    with pytest.raises(ValueError, match="same number of ranks on every node"):
+        ManagedDynamoRuntime(cluster=MultinodeCluster(), config=_config(tp=6))
 
 
 def test_runtime_builds_stable_disaggregated_roles_and_rejects_wrong_gpu_count() -> (
@@ -263,6 +276,18 @@ def test_vllm_node_local_port_bands_are_deterministic() -> None:
         4201,
         4202,
     ]
+
+
+def test_multinode_engine_rank_groups_must_be_even() -> None:
+    reservations = [object(), object(), object()]
+    metadata = [
+        {"node_ip": "10.0.0.1", "gpu_id": 0},
+        {"node_ip": "10.0.0.1", "gpu_id": 1},
+        {"node_ip": "10.0.0.2", "gpu_id": 0},
+    ]
+
+    with pytest.raises(ValueError, match="same number of ranks on every node"):
+        _group_engine_ranks_by_node(reservations, metadata)
 
 
 def test_startup_failure_cleans_up_partial_worker_pool(monkeypatch, tmp_path) -> None:
@@ -498,6 +523,7 @@ def test_worker_registers_process_group_immediately_after_launch(monkeypatch) ->
         startup_timeout_s=5,
         seed=0,
         cleanup_reservation=reservation,
+        distributed_launch=None,
     )
 
     assert reservation.register_process_group.calls == [((4321,), {})]
@@ -510,6 +536,39 @@ def test_worker_registers_process_group_immediately_after_launch(monkeypatch) ->
         launch["command"][launch["command"].index("--kv-events-config") + 1]
     )
     assert kv_event_config["endpoint"] == "tcp://*:4200"
+
+
+def test_headless_worker_uses_runtime_owned_distributed_args() -> None:
+    argv = ["--model", "model"]
+
+    _add_distributed_launch_args(
+        argv,
+        DynamoDistributedLaunch(
+            nnodes=2,
+            node_rank=1,
+            master_addr="10.0.0.1",
+            master_port=1500,
+            headless=True,
+        ),
+    )
+
+    assert argv == [
+        "--model",
+        "model",
+        "--data-parallel-backend",
+        "mp",
+        "--distributed-executor-backend",
+        "mp",
+        "--nnodes",
+        "2",
+        "--node-rank",
+        "1",
+        "--master-addr",
+        "10.0.0.1",
+        "--master-port",
+        "1500",
+        "--headless",
+    ]
 
 
 def test_shutdown_guards_each_owned_resource_independently(monkeypatch) -> None:
@@ -550,6 +609,7 @@ def test_fixed_pool_detects_worker_membership_change(monkeypatch) -> None:
     reservation = _FakeReservation(metadata=reservation_metadata)
     pool = object.__new__(FixedDynamoWorkerPool)
     pool._workers = [_FakeWorker(metadata={"instance_id": "changed"})]
+    pool._leader_workers = pool._workers
     pool._reservations = [reservation]
     pool._cleanup_reservations = [reservation]
     pool._reservation_metadata = [reservation_metadata]
@@ -578,6 +638,7 @@ def test_fixed_pool_detects_reservation_membership_change(monkeypatch) -> None:
     reservation = _FakeReservation(metadata=changed_reservation)
     pool = object.__new__(FixedDynamoWorkerPool)
     pool._workers = [_FakeWorker(metadata=expected_worker)]
+    pool._leader_workers = pool._workers
     pool._reservations = [reservation]
     pool._cleanup_reservations = [reservation]
     pool._reservation_metadata = [expected_reservation]
@@ -621,6 +682,10 @@ def test_fixed_pool_tracks_worker_before_metadata_failure(monkeypatch) -> None:
         @staticmethod
         def get_placement_groups():
             return [SimpleNamespace(bundle_count=1)]
+
+        @staticmethod
+        def get_sorted_bundle_indices():
+            return None
 
     pool = FixedDynamoWorkerPool(
         cluster=Cluster(),
@@ -666,22 +731,18 @@ def test_fixed_pool_tracks_worker_before_metadata_failure(monkeypatch) -> None:
     assert pool._metadata == [{}]
 
 
-def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
+def _start_fake_pool(
     monkeypatch,
-) -> None:
-    reservation_objects = [
-        _FakeReservation(
-            metadata={"node_ip": "10.0.0.1", "gpu_id": 0}, system_port=4001
-        ),
-        _FakeReservation(
-            metadata={"node_ip": "10.0.0.1", "gpu_id": 1}, system_port=4002
-        ),
-    ]
+    *,
+    reservation_objects,
+    workers,
+    cluster,
+    config,
+    engine_world_size,
+    worker_roles,
+    selected_ports=None,
+):
     reservations = iter(reservation_objects)
-    workers = [
-        _FakeWorker(metadata={"instance_id": "worker-0"}),
-        _FakeWorker(metadata={"instance_id": "worker-1"}),
-    ]
     workers_to_launch = iter(workers)
     launch_kwargs = []
     actor_names = []
@@ -711,17 +772,12 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
 
             return CapturingRemoteFactory(worker)
 
-    class Cluster:
-        @staticmethod
-        def get_placement_groups():
-            return [SimpleNamespace(bundle_count=2)]
-
     pool = FixedDynamoWorkerPool(
-        cluster=Cluster(),
-        config=_config(),
+        cluster=cluster,
+        config=config,
         namespace="nemo-rl-test",
-        engine_world_size=1,
-        worker_roles=["decode", "prefill"],
+        engine_world_size=engine_world_size,
+        worker_roles=worker_roles,
         manager_env={},
         startup_timeout_s=5,
     )
@@ -742,12 +798,18 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
         lambda **kwargs: kwargs,
     )
 
+    port_results = iter(selected_ports or [])
+
     def fake_get(refs, **kwargs):
-        if isinstance(refs, int):
-            return refs
-        if isinstance(refs, list) and refs and "node_ip" in refs[0]:
-            return refs
-        assert pool._workers == workers
+        if isinstance(refs, int) and selected_ports is not None:
+            return next(port_results)
+        if (
+            isinstance(refs, list)
+            and refs
+            and isinstance(refs[0], dict)
+            and "instance_id" in refs[0]
+        ):
+            assert pool._workers == workers
         return refs
 
     monkeypatch.setattr(
@@ -755,55 +817,128 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
     )
 
     pool.start()
+    return pool, launch_kwargs, actor_names
+
+
+def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
+    monkeypatch,
+) -> None:
+    reservations = [
+        _FakeReservation(
+            metadata={
+                "node_ip": "10.0.0.1",
+                "gpu_id": gpu_id,
+            },
+            system_port=4001 + gpu_id,
+        )
+        for gpu_id in range(2)
+    ]
+    workers = [
+        _FakeWorker(metadata={"instance_id": "worker-0"}),
+        _FakeWorker(metadata={"instance_id": "worker-1"}),
+    ]
+    cluster = SimpleNamespace(
+        get_placement_groups=lambda: [SimpleNamespace(bundle_count=2)],
+        get_sorted_bundle_indices=lambda: None,
+    )
+
+    pool, launches, actor_names = _start_fake_pool(
+        monkeypatch,
+        reservation_objects=reservations,
+        workers=workers,
+        cluster=cluster,
+        config=_config(),
+        engine_world_size=1,
+        worker_roles=["decode", "prefill"],
+    )
 
     assert pool._metadata == [
         {"instance_id": "worker-0"},
         {"instance_id": "worker-1"},
     ]
-    assert [kwargs["system_port"] for kwargs in launch_kwargs] == [4001, 4002]
-    assert [kwargs["vllm_port"] for kwargs in launch_kwargs] == [7000, 7100]
-    assert [kwargs["nixl_port"] for kwargs in launch_kwargs] == [4100, 4101]
-    assert [kwargs["kv_event_port"] for kwargs in launch_kwargs] == [None, 4201]
-    assert [kwargs["worker_role"] for kwargs in launch_kwargs] == [
-        "decode",
-        "prefill",
-    ]
+    assert [launch["system_port"] for launch in launches] == [4001, 4002]
+    assert [launch["vllm_port"] for launch in launches] == [7000, 7100]
+    assert [launch["nixl_port"] for launch in launches] == [4100, 4101]
+    assert [launch["kv_event_port"] for launch in launches] == [None, 4201]
+    assert [launch["worker_role"] for launch in launches] == ["decode", "prefill"]
+    assert [launch["distributed_launch"] for launch in launches] == [None, None]
+    assert [launch["cleanup_reservation"] for launch in launches] == reservations
     assert actor_names == [
         "nemo-rl-test-dynamo-vllm-decode-0",
         "nemo-rl-test-dynamo-vllm-prefill-0",
     ]
-    assert [kwargs["cleanup_reservation"] for kwargs in launch_kwargs] == (
-        reservation_objects
+
+
+def test_fixed_pool_launches_topology_ordered_leader_and_headless_workers(
+    monkeypatch,
+) -> None:
+    reservations = [
+        _FakeReservation(metadata={"node_ip": node, "gpu_id": gpu_id})
+        for node, gpu_id in (
+            ("10.0.0.1", 2),
+            ("10.0.0.1", 3),
+            ("10.0.0.2", 0),
+            ("10.0.0.2", 1),
+        )
+    ]
+    leader = _FakeWorker(metadata={"instance_id": "prefill-0"})
+    headless = _FakeWorker(metadata={"headless": True})
+    cluster = SimpleNamespace(
+        port_range_low=1400,
+        port_range_high=2000,
+        get_placement_groups=lambda: [SimpleNamespace(bundle_count=4)],
+        get_sorted_bundle_indices=lambda: [2, 3, 0, 1],
     )
-    assert reservation_objects[0].select_free_port.calls == [
-        (
-            (),
-            {
-                "port_range_low": 4000,
-                "port_range_high": 4100,
-                "excluded_ports": [],
-            },
-        )
+
+    pool, launches, actor_names = _start_fake_pool(
+        monkeypatch,
+        reservation_objects=reservations,
+        workers=[leader, headless],
+        cluster=cluster,
+        config=_config(tp=4),
+        engine_world_size=4,
+        worker_roles=["prefill"],
+        selected_ports=[4000, 1500],
+    )
+
+    assert pool.size == 1
+    assert pool._workers == [leader, headless]
+    assert pool._leader_workers == [leader]
+    assert pool._metadata == [{"instance_id": "prefill-0"}]
+    assert [launch["cuda_devices"] for launch in launches] == [[2, 3], [0, 1]]
+    assert [launch["system_port"] for launch in launches] == [4000, None]
+    assert [launch["nixl_port"] for launch in launches] == [4100, None]
+    assert launches[0]["distributed_launch"] == DynamoDistributedLaunch(
+        nnodes=2,
+        node_rank=0,
+        master_addr="10.0.0.1",
+        master_port=1500,
+        headless=False,
+    )
+    assert launches[1]["distributed_launch"] == DynamoDistributedLaunch(
+        nnodes=2,
+        node_rank=1,
+        master_addr="10.0.0.1",
+        master_port=1500,
+        headless=True,
+    )
+    assert actor_names == [
+        "nemo-rl-test-dynamo-vllm-prefill-0",
+        "nemo-rl-test-dynamo-vllm-prefill-0-headless-1",
     ]
-    assert reservation_objects[1].select_free_port.calls == [
-        (
-            (),
-            {
-                "port_range_low": 4000,
-                "port_range_high": 4100,
-                "excluded_ports": [4001],
-            },
-        )
-    ]
+    assert headless.metadata.calls == []
+    assert headless.is_alive.calls == [((), {})]
 
 
 def test_fixed_pool_shutdown_releases_workers_and_reservations(monkeypatch) -> None:
     pool = object.__new__(FixedDynamoWorkerPool)
-    worker = _FakeWorker()
-    reservation = _FakeReservation()
-    pool._workers = [worker]
-    pool._reservations = [reservation]
-    pool._cleanup_reservations = [reservation]
+    leader = _FakeWorker()
+    headless = _FakeWorker()
+    reservations = (_FakeReservation(), _FakeReservation())
+    pool._workers = [leader, headless]
+    pool._leader_workers = [leader]
+    pool._reservations = list(reservations)
+    pool._cleanup_reservations = list(reservations)
     pool._reservation_metadata = []
     pool._metadata = [{"instance_id": "worker-0", "process_pid": 1234}]
     killed = []
@@ -816,9 +951,22 @@ def test_fixed_pool_shutdown_releases_workers_and_reservations(monkeypatch) -> N
         lambda actor, **kwargs: killed.append(actor),
     )
     pool.shutdown()
-    assert killed == [worker, reservation]
+    assert killed == [leader, headless, *reservations]
     assert pool._workers == []
     assert pool._reservations == []
+
+
+def test_fixed_pool_health_includes_headless_workers(monkeypatch) -> None:
+    pool = object.__new__(FixedDynamoWorkerPool)
+    pool._workers = [_FakeWorker(alive=True), _FakeWorker(alive=False)]
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.ray.get",
+        lambda refs, **kwargs: refs,
+    )
+
+    with pytest.raises(RuntimeError, match="vLLM worker exited"):
+        pool.validate([])
 
 
 def test_fixed_pool_shutdown_uses_registered_pid_when_worker_dies(monkeypatch) -> None:
@@ -826,6 +974,7 @@ def test_fixed_pool_shutdown_uses_registered_pid_when_worker_dies(monkeypatch) -
     reservation = _FakeReservation()
     pool = object.__new__(FixedDynamoWorkerPool)
     pool._workers = [worker]
+    pool._leader_workers = [worker]
     pool._reservations = [reservation]
     pool._cleanup_reservations = [reservation]
     pool._reservation_metadata = []

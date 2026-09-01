@@ -361,6 +361,29 @@ def test_worker_argv_rejects_replaced_and_managed_options() -> None:
             kv_event_port=None,
         )
 
+    config = _dynamo_cfg()
+    config["worker_args"]["extra_cli_args"] = ["--nnodes", "2"]
+    with pytest.raises(ValueError, match="may not override managed option --nnodes"):
+        build_dynamo_vllm_argv(
+            model_name="model",
+            namespace="namespace",
+            seed=0,
+            vllm_cfg=_config()["vllm_cfg"],
+            vllm_kwargs={},
+            dynamo_cfg=DynamoCfg.model_validate(config),
+            worker_role="aggregated",
+            kv_event_port=None,
+        )
+
+
+@pytest.mark.parametrize("source", ["vllm_cfg", "vllm_kwargs"])
+def test_config_rejects_user_owned_multinode_launch_fields(source) -> None:
+    config = _config()
+    config[source]["nnodes"] = 2
+
+    with pytest.raises(ValidationError, match="nnodes.*managed"):
+        DynamoConfig.model_validate(config)
+
 
 def test_config_accepts_inherited_unused_sections() -> None:
     config = _config(

@@ -985,6 +985,12 @@ class RayVirtualCluster:
         )
         return [pg for pg in self._node_placement_groups if pg.bundle_specs]
 
+    def get_sorted_bundle_indices(self) -> list[int] | None:
+        """Return the topology-ordered unified placement-group bundles."""
+        if self._sorted_bundle_indices is None:
+            return None
+        return list(self._sorted_bundle_indices)
+
     def world_size(self) -> int:
         return self._world_size
 

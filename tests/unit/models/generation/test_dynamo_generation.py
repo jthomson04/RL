@@ -36,6 +36,25 @@ from nemo_rl.models.generation.dynamo.metrics import (
 from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
 
 
+class _Cluster:
+    num_gpus_per_node = 8
+
+    def __init__(self) -> None:
+        self.placement_calls = []
+
+    def _init_placement_groups(self, **kwargs) -> None:
+        self.placement_calls.append(kwargs)
+
+
+def test_dynamo_reuses_native_vllm_cross_node_placement() -> None:
+    cluster = _Cluster()
+    cluster.num_gpus_per_node = 4
+
+    DynamoGeneration.init_cluster_placement_groups(cluster, _config(tp=8))
+
+    assert cluster.placement_calls == [{"strategy": "PACK", "use_unified_pg": True}]
+
+
 def _config(*, tp: int = 1, expose_http_server: bool = False) -> dict[str, Any]:
     return {
         "backend": "dynamo",
@@ -160,7 +179,7 @@ def test_runtime_start_world_size_sender_geometry_and_shutdown(monkeypatch) -> N
         ],
         calls=calls,
     )
-    generation = DynamoGeneration(cluster=object(), config=_config(tp=2))
+    generation = DynamoGeneration(cluster=_Cluster(), config=_config(tp=2))
 
     assert calls[:2] == ["init", "start"]
     assert generation.frontend_url == "http://10.0.0.1:3000/v1"
@@ -186,7 +205,7 @@ def test_blocking_generate_is_rejected_and_async_generation_uses_http(
         return _completion_response([8, 9])
 
     monkeypatch.setattr(generation_module, "async_http_post_json", fake_post)
-    generation = DynamoGeneration(cluster=object(), config=_config())
+    generation = DynamoGeneration(cluster=_Cluster(), config=_config())
     with pytest.raises(NotImplementedError, match="generate_async"):
         generation.generate(_data())
 
@@ -204,7 +223,7 @@ def test_blocking_generate_is_rejected_and_async_generation_uses_http(
 
 def test_prompt_at_context_limit_is_rejected(monkeypatch) -> None:
     _patch_runtime(monkeypatch)
-    generation = DynamoGeneration(cluster=object(), config=_config())
+    generation = DynamoGeneration(cluster=_Cluster(), config=_config())
 
     with pytest.raises(ValueError, match="prompt length 5 must be less than"):
         generation._allowed_new_tokens(5)
@@ -212,7 +231,7 @@ def test_prompt_at_context_limit_is_rejected(monkeypatch) -> None:
 
 def test_finish_generation_invalidates_sync_rollout_cache(monkeypatch) -> None:
     _patch_runtime(monkeypatch)
-    generation = DynamoGeneration(cluster=object(), config=_config())
+    generation = DynamoGeneration(cluster=_Cluster(), config=_config())
     generation.invalidate_kv_cache = MagicMock(return_value=True)
 
     assert generation.finish_generation()
@@ -223,7 +242,7 @@ def test_merged_stop_strings_enforce_dynamo_limit(monkeypatch) -> None:
     _patch_runtime(monkeypatch)
     config = _config()
     config["stop_strings"] = [f"configured-{index}" for index in range(16)]
-    generation = DynamoGeneration(cluster=object(), config=config)
+    generation = DynamoGeneration(cluster=_Cluster(), config=config)
 
     assert (
         len(
@@ -255,7 +274,7 @@ def test_token_wrapper_is_used_for_nemo_gym(monkeypatch) -> None:
     monkeypatch.setattr(generation_module, "DynamoTokenWrapperServer", FakeWrapper)
     tokenizer = object()
     generation = DynamoGeneration(
-        cluster=object(),
+        cluster=_Cluster(),
         config=_config(expose_http_server=True),
         tokenizer=tokenizer,
         tokenizer_config={"chat_template_kwargs": {"enable_thinking": False}},
@@ -293,7 +312,7 @@ def test_refit_rank_offsets_update_and_pickled_cache_invalidation(monkeypatch) -
     )
     monkeypatch.setattr(refit_module.ray, "get", lambda refs: refs)
 
-    generation = DynamoGeneration(cluster=object(), config=_config(tp=2))
+    generation = DynamoGeneration(cluster=_Cluster(), config=_config(tp=2))
     generation.prepare_refit_info({"weight": (torch.Size([4, 8]), torch.bfloat16)})
     assert generation.init_collective("10.1.0.1", 1500, 7, train_world_size=3) == [
         True,
@@ -468,7 +487,7 @@ def test_completion_retry_eventually_succeeds(monkeypatch) -> None:
 
     monkeypatch.setattr(generation_module, "async_http_post_json", fake_post)
     monkeypatch.setattr(generation_module.asyncio, "sleep", no_sleep)
-    generation = DynamoGeneration(cluster=object(), config=_config())
+    generation = DynamoGeneration(cluster=_Cluster(), config=_config())
 
     token_ids, _, _ = asyncio.run(
         generation._post_completion_request(
@@ -499,7 +518,7 @@ def test_completion_retry_stops_on_nonretryable_or_exhaustion(
 
     monkeypatch.setattr(generation_module, "async_http_post_json", fake_post)
     monkeypatch.setattr(generation_module.asyncio, "sleep", no_sleep)
-    generation = DynamoGeneration(cluster=object(), config=_config())
+    generation = DynamoGeneration(cluster=_Cluster(), config=_config())
 
     with pytest.raises(RuntimeError, match=f"HTTP {status}"):
         asyncio.run(
@@ -532,7 +551,7 @@ def test_direct_completions_are_not_limited_by_default_thread_pool(
         return _completion_response([8])
 
     monkeypatch.setattr(generation_module, "async_http_post_json", fake_post)
-    generation = DynamoGeneration(cluster=object(), config=_config())
+    generation = DynamoGeneration(cluster=_Cluster(), config=_config())
 
     async def run_requests():
         tasks = [
