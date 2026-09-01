@@ -90,6 +90,16 @@ _VLLM_SINGLE_RANK_ONLY_FIELDS = {
     "prefill_context_parallel_size",
 }
 
+_VLLM_MANAGED_MULTINODE_FIELDS = {
+    "data_parallel_backend",
+    "distributed_executor_backend",
+    "headless",
+    "master_addr",
+    "master_port",
+    "nnodes",
+    "node_rank",
+}
+
 
 class DynamoWorkerArgs(BaseModel, extra="forbid"):
     """Structured arguments passed to every managed ``dynamo.vllm`` worker."""
@@ -240,6 +250,7 @@ class DynamoVllmConfig(BaseModel, extra="allow"):
             | _VLLM_CFG_MANAGED_RUNTIME
             | _VLLM_CFG_INAPPLICABLE
             | _VLLM_SINGLE_RANK_ONLY_FIELDS
+            | _VLLM_MANAGED_MULTINODE_FIELDS
         )
         unclassified = {
             key for key in configured_fields if getattr(self, key, None) is not None
@@ -275,7 +286,7 @@ class DynamoConfig(BaseModel, extra="allow"):
 
     @property
     def engine_world_size(self) -> int:
-        """Return the derived ranks in each single-node vLLM engine."""
+        """Return the derived ranks in each vLLM engine."""
         return self.vllm_cfg.tensor_parallel_size * self.vllm_cfg.pipeline_parallel_size
 
     @property
@@ -364,6 +375,16 @@ class DynamoConfig(BaseModel, extra="allow"):
                 "when backend='dynamo'"
             )
         vllm_extra = self.vllm_cfg.model_extra or {}
+        for field in sorted(_VLLM_MANAGED_MULTINODE_FIELDS):
+            for source, value in (
+                ("vllm_cfg", vllm_extra.get(field)),
+                ("vllm_kwargs", self.vllm_kwargs.get(field)),
+            ):
+                if value is not None:
+                    raise ValueError(
+                        f"policy.generation.{source}.{field} is managed by the "
+                        "Dynamo multi-node runtime"
+                    )
         for field in sorted(_VLLM_SINGLE_RANK_ONLY_FIELDS):
             for source, value in (
                 ("vllm_cfg", vllm_extra.get(field)),

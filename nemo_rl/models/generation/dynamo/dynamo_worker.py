@@ -20,6 +20,7 @@ import signal
 import socket
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,41 @@ from nemo_rl.models.generation.dynamo.venv import (
     get_dynamo_python,
     get_dynamo_venv_dir,
 )
+
+
+@dataclass(frozen=True)
+class DynamoDistributedLaunch:
+    """Internal vLLM multiprocessing coordinates for one engine process."""
+
+    nnodes: int
+    node_rank: int
+    master_addr: str
+    master_port: int
+    headless: bool
+
+
+def _add_distributed_launch_args(
+    argv: list[str], launch: DynamoDistributedLaunch
+) -> None:
+    """Add runtime-owned vLLM multiprocessing arguments."""
+    argv.extend(
+        [
+            "--data-parallel-backend",
+            "mp",
+            "--distributed-executor-backend",
+            "mp",
+            "--nnodes",
+            str(launch.nnodes),
+            "--node-rank",
+            str(launch.node_rank),
+            "--master-addr",
+            launch.master_addr,
+            "--master-port",
+            str(launch.master_port),
+        ]
+    )
+    if launch.headless:
+        argv.append("--headless")
 
 
 @ray.remote(num_cpus=0)
@@ -105,7 +141,7 @@ class DynamoGpuReservation:  # pragma: no cover
 
 @ray.remote(num_cpus=0)
 class DynamoVllmWorker:  # pragma: no cover
-    """Own one ``dynamo.vllm`` subprocess for a model-parallel GPU group."""
+    """Own one node-local ``dynamo.vllm`` subprocess for a Dynamo engine."""
 
     def __init__(
         self,
@@ -114,7 +150,7 @@ class DynamoVllmWorker:  # pragma: no cover
         namespace: str,
         group_name: str,
         cuda_devices: list[int],
-        system_port: int,
+        system_port: int | None,
         vllm_port: int,
         nixl_port: int | None,
         kv_event_port: int | None,
@@ -123,6 +159,7 @@ class DynamoVllmWorker:  # pragma: no cover
         startup_timeout_s: float,
         seed: int,
         cleanup_reservation: ray.actor.ActorHandle,
+        distributed_launch: DynamoDistributedLaunch | None,
     ) -> None:
         self._group_name = group_name
         self._node_ip = _get_node_ip_local()
@@ -132,12 +169,13 @@ class DynamoVllmWorker:  # pragma: no cover
         self._kv_event_port = kv_event_port
         self._worker_role = worker_role
         self._process: subprocess.Popen | None = None
-        managed_ports = [
-            ("DYN_SYSTEM_PORT", system_port),
-        ]
+        managed_ports = []
+        if system_port is not None:
+            managed_ports.append(("DYN_SYSTEM_PORT", system_port))
         if nixl_port is not None:
             managed_ports.append(("VLLM_NIXL_SIDE_CHANNEL_PORT", nixl_port))
-        if kv_event_port is not None:
+        is_headless = distributed_launch is not None and distributed_launch.headless
+        if kv_event_port is not None and not is_headless:
             managed_ports.append(("Dynamo KV-event port", kv_event_port))
         for env_name, port in managed_ports:
             try:
@@ -158,13 +196,14 @@ class DynamoVllmWorker:  # pragma: no cover
         managed_worker_env = {
             **manager_env,
             "CUDA_VISIBLE_DEVICES": ",".join(str(gpu) for gpu in cuda_devices),
-            "DYN_SYSTEM_PORT": str(system_port),
             "PYTHONHASHSEED": "0",
             "VLLM_PORT": str(vllm_port),
             "VLLM_SKIP_P2P_CHECK": "1",
             "VIRTUAL_ENV": dynamo_venv,
             "UV_PROJECT_ENVIRONMENT": dynamo_venv,
         }
+        if system_port is not None:
+            managed_worker_env["DYN_SYSTEM_PORT"] = str(system_port)
         if nixl_port is not None:
             managed_worker_env.update(
                 {
@@ -187,6 +226,8 @@ class DynamoVllmWorker:  # pragma: no cover
             worker_role=worker_role,
             kv_event_port=kv_event_port,
         )
+        if distributed_launch is not None:
+            _add_distributed_launch_args(argv, distributed_launch)
         self._validate_argv(
             dynamo_python,
             argv,
@@ -200,10 +241,11 @@ class DynamoVllmWorker:  # pragma: no cover
             for key, value in worker_env.items()
             if key.startswith(("CUDA_", "DYN_", "ETCD_", "NATS_", "NCCL_", "VLLM_"))
         }
+        system_url = self.system_url if system_port is not None else None
         print(
             f"  [Dynamo:{group_name}] launching argv={redact_argv(command)!r} "
             f"env={redact_environment(relevant_env)!r} "
-            f"system_url={self.system_url}",
+            f"system_url={system_url}",
             flush=True,
         )
         try:
@@ -213,13 +255,18 @@ class DynamoVllmWorker:  # pragma: no cover
             ray.get(
                 cleanup_reservation.register_process_group.remote(self._process.pid)
             )
-            self._wait_for_system_port(startup_timeout_s)
+            if system_port is not None:
+                self._wait_for_system_port(startup_timeout_s)
         except Exception:
             self._stop_process()
             raise
 
     @property
     def system_url(self) -> str:
+        if self._system_port is None:
+            raise RuntimeError(
+                f"Headless Dynamo worker {self._group_name} has no system endpoint."
+            )
         host = f"[{self._node_ip}]" if ":" in self._node_ip else self._node_ip
         return f"http://{host}:{self._system_port}"
 
@@ -288,6 +335,10 @@ class DynamoVllmWorker:  # pragma: no cover
         process = self._process
         if process is None:
             raise RuntimeError(f"dynamo.vllm for {self._group_name} is not running.")
+        if self._system_port is None:
+            raise RuntimeError(
+                f"Headless Dynamo worker {self._group_name} has no engine metadata."
+            )
         return {
             "instance_id": self._group_name,
             "system_url": self.system_url,

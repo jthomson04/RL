@@ -39,6 +39,7 @@ from nemo_rl.models.generation.interfaces import (
     reject_unenforceable_refit_deadline,
     verify_right_padding,
 )
+from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
 
 LOGGER = logging.getLogger(__name__)
 
@@ -143,6 +144,14 @@ def _parse_dynamo_completion_response(
 class DynamoGeneration(GenerationInterface):
     """Own a fixed Dynamo service fleet and expose it for NeMo-RL rollouts."""
 
+    @staticmethod
+    def init_cluster_placement_groups(
+        cluster: RayVirtualCluster,
+        config: dict[str, Any],
+    ) -> None:
+        """Use native vLLM placement for node-local and cross-node engines."""
+        VllmGeneration.init_cluster_placement_groups(cluster, config)
+
     def __init__(
         self,
         cluster: Optional[RayVirtualCluster],
@@ -178,6 +187,7 @@ class DynamoGeneration(GenerationInterface):
             raise RuntimeError(
                 "Managed Dynamo requires a non-colocated inference RayVirtualCluster."
             )
+        self.init_cluster_placement_groups(cluster, self.cfg)
         self._managed_runtime: Optional[ManagedDynamoRuntime] = ManagedDynamoRuntime(
             cluster=cluster,
             config=self.cfg,

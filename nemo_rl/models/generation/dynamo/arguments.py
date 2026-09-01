@@ -26,9 +26,16 @@ from nemo_rl.models.generation.dynamo.config import (
 
 _MANAGED_FLAGS = {
     "--component",
+    "--data-parallel-backend",
+    "--distributed-executor-backend",
     "--disaggregation-mode",
+    "--headless",
     "--model-name",
     "--model-path",
+    "--master-addr",
+    "--master-port",
+    "--nnodes",
+    "--node-rank",
     "--endpoint",
     "--kv-events-config",
     "--kv-transfer-config",

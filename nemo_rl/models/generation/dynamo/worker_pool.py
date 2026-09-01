@@ -36,6 +36,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.models.generation.dynamo.config import DynamoWorkerRole
 from nemo_rl.models.generation.dynamo.dynamo_worker import (
+    DynamoDistributedLaunch,
     DynamoGpuReservation,
     DynamoVllmWorker,
 )
@@ -70,8 +71,29 @@ def _kv_event_port_for_node_slot(node_slot: int) -> int:
     return port
 
 
+def _group_engine_ranks_by_node(
+    reservations: Sequence[ray.actor.ActorHandle],
+    metadata: Sequence[dict[str, Any]],
+) -> list[tuple[str, list[tuple[ray.actor.ActorHandle, dict[str, Any]]]]]:
+    """Group an engine's ordered ranks by node and require an even split."""
+    nodes: dict[str, list[tuple[ray.actor.ActorHandle, dict[str, Any]]]] = {}
+    for reservation, rank_metadata in zip(reservations, metadata, strict=True):
+        nodes.setdefault(rank_metadata["node_ip"], []).append(
+            (reservation, rank_metadata)
+        )
+    ranks_per_node = {len(node_ranks) for node_ranks in nodes.values()}
+    if len(ranks_per_node) != 1:
+        rank_counts = {node: len(node_ranks) for node, node_ranks in nodes.items()}
+        raise ValueError(
+            "Managed Dynamo multi-node engines require the same number "
+            "of ranks on every node: "
+            f"ranks_per_node={rank_counts}"
+        )
+    return list(nodes.items())
+
+
 class FixedDynamoWorkerPool:
-    """Reserve inference GPUs and launch one worker per model-parallel group."""
+    """Reserve inference GPUs and launch each engine's node-local processes."""
 
     def __init__(
         self,
@@ -94,6 +116,7 @@ class FixedDynamoWorkerPool:
         self._manager_env = manager_env
         self._startup_timeout_s = startup_timeout_s
         self._workers: list[ray.actor.ActorHandle] = []
+        self._leader_workers: list[ray.actor.ActorHandle] = []
         self._reservations: list[ray.actor.ActorHandle] = []
         self._cleanup_reservations: list[ray.actor.ActorHandle] = []
         self._reservation_metadata: list[dict[str, Any]] = []
@@ -101,7 +124,7 @@ class FixedDynamoWorkerPool:
 
     @property
     def size(self) -> int:
-        return len(self._workers)
+        return len(self._leader_workers)
 
     def is_alive(self) -> bool:
         """Return whether every managed vLLM subprocess is still alive."""
@@ -123,80 +146,145 @@ class FixedDynamoWorkerPool:
         role_indices: Counter[str] = Counter()
         engine_slots_by_node: dict[str, int] = {}
         system_ports_by_node: dict[str, set[int]] = {}
+        master_ports_by_node: dict[str, set[int]] = {}
+        headless_startup_refs: list[ray.ObjectRef] = []
         metadata_refs: list[ray.ObjectRef] = []
-        for pg_index, placement_group in enumerate(placement_groups):
+        engine_groups: list[tuple[int, Any, list[int]]] = []
+        if len(placement_groups) == 1:
+            placement_group = placement_groups[0]
             bundle_count = placement_group.bundle_count
             if bundle_count % self._engine_world_size != 0:
                 raise ValueError(
-                    f"Inference placement group {pg_index} has {bundle_count} GPU "
+                    f"Inference placement group 0 has {bundle_count} GPU "
                     f"bundles, which is not divisible by engine_world_size="
                     f"{self._engine_world_size}."
                 )
-            for start in range(0, bundle_count, self._engine_world_size):
-                bundle_indices = list(range(start, start + self._engine_world_size))
-                reservation_handles = []
-                for bundle_index in bundle_indices:
-                    strategy = PlacementGroupSchedulingStrategy(
-                        placement_group=placement_group,
-                        placement_group_bundle_index=bundle_index,
-                        placement_group_capture_child_tasks=True,
-                    )
-                    reservation_handles.append(
-                        DynamoGpuReservation.options(
-                            num_gpus=1,
-                            runtime_env=runtime_env,
-                            scheduling_strategy=strategy,
-                        ).remote()
-                    )
-                self._reservations.extend(reservation_handles)
-                reservation_metadata = ray.get(
-                    [handle.metadata.remote() for handle in reservation_handles]
-                )
-                self._reservation_metadata.extend(reservation_metadata)
-                node_ips = {item["node_ip"] for item in reservation_metadata}
-                if len(node_ips) != 1:
-                    raise RuntimeError(
-                        "A managed Dynamo engine group spans multiple nodes. "
-                        "Multi-node TP/PP is not supported in the fixed-fleet milestone."
-                    )
-                cuda_devices = [item["gpu_id"] for item in reservation_metadata]
-                node_ip = next(iter(node_ips))
-                node_slot = engine_slots_by_node.get(node_ip, 0)
-                engine_slots_by_node[node_ip] = node_slot + 1
-                system_ports = system_ports_by_node.setdefault(node_ip, set())
-                system_port = ray.get(
-                    reservation_handles[0].select_free_port.remote(
-                        port_range_low=DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW,
-                        port_range_high=DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH,
-                        excluded_ports=sorted(system_ports),
+            bundle_order = self._cluster.get_sorted_bundle_indices()
+            if bundle_order is None:
+                bundle_order = list(range(bundle_count))
+            for start in range(0, len(bundle_order), self._engine_world_size):
+                engine_groups.append(
+                    (
+                        0,
+                        placement_group,
+                        bundle_order[start : start + self._engine_world_size],
                     )
                 )
-                system_ports.add(system_port)
-                vllm_port = _vllm_port_for_node_slot(node_slot)
-                if group_index >= len(self._worker_roles):
+        else:
+            for pg_index, placement_group in enumerate(placement_groups):
+                bundle_count = placement_group.bundle_count
+                if bundle_count % self._engine_world_size != 0:
                     raise ValueError(
-                        "Inference placement groups contain more engine groups than "
-                        f"the configured managed worker roles: {len(self._worker_roles)}"
+                        f"Inference placement group {pg_index} has {bundle_count} GPU "
+                        f"bundles, which is not divisible by engine_world_size="
+                        f"{self._engine_world_size}."
                     )
-                worker_role = self._worker_roles[group_index]
-                nixl_port = (
-                    _nixl_port_for_node_slot(node_slot)
-                    if worker_role != "aggregated"
-                    else None
-                )
-                role_index = role_indices[worker_role]
-                role_indices[worker_role] += 1
-                kv_event_port = (
-                    _kv_event_port_for_node_slot(node_slot)
-                    if worker_role == "prefill"
-                    else None
-                )
-                group_name = f"{self._namespace}-dynamo-vllm-{worker_role}-{role_index}"
-                leader_strategy = PlacementGroupSchedulingStrategy(
+                for start in range(0, bundle_count, self._engine_world_size):
+                    engine_groups.append(
+                        (
+                            pg_index,
+                            placement_group,
+                            list(range(start, start + self._engine_world_size)),
+                        )
+                    )
+
+        for pg_index, placement_group, bundle_indices in engine_groups:
+            reservation_handles = []
+            for bundle_index in bundle_indices:
+                strategy = PlacementGroupSchedulingStrategy(
                     placement_group=placement_group,
-                    placement_group_bundle_index=bundle_indices[0],
+                    placement_group_bundle_index=bundle_index,
                     placement_group_capture_child_tasks=True,
                 )
+                reservation_handles.append(
+                    DynamoGpuReservation.options(
+                        num_gpus=1,
+                        runtime_env=runtime_env,
+                        scheduling_strategy=strategy,
+                    ).remote()
+                )
+            self._reservations.extend(reservation_handles)
+            reservation_metadata = ray.get(
+                [handle.metadata.remote() for handle in reservation_handles]
+            )
+            self._reservation_metadata.extend(reservation_metadata)
+            node_items = _group_engine_ranks_by_node(
+                reservation_handles, reservation_metadata
+            )
+            leader_ip, leader_ranks = node_items[0]
+            node_slots: dict[str, int] = {}
+            for node_ip, _ in node_items:
+                node_slot = engine_slots_by_node.get(node_ip, 0)
+                engine_slots_by_node[node_ip] = node_slot + 1
+                node_slots[node_ip] = node_slot
+
+            system_ports = system_ports_by_node.setdefault(leader_ip, set())
+            system_port = ray.get(
+                leader_ranks[0][0].select_free_port.remote(
+                    port_range_low=DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW,
+                    port_range_high=DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH,
+                    excluded_ports=sorted(system_ports),
+                )
+            )
+            system_ports.add(system_port)
+            if group_index >= len(self._worker_roles):
+                raise ValueError(
+                    "Inference placement groups contain more engine groups than "
+                    f"the configured managed worker roles: {len(self._worker_roles)}"
+                )
+            worker_role = self._worker_roles[group_index]
+            leader_slot = node_slots[leader_ip]
+            nixl_port = (
+                _nixl_port_for_node_slot(leader_slot)
+                if worker_role != "aggregated"
+                else None
+            )
+            role_index = role_indices[worker_role]
+            role_indices[worker_role] += 1
+            kv_event_port = (
+                _kv_event_port_for_node_slot(leader_slot)
+                if worker_role == "prefill"
+                else None
+            )
+            group_name = f"{self._namespace}-dynamo-vllm-{worker_role}-{role_index}"
+            distributed_launch: tuple[int, str, int] | None = None
+            if len(node_items) > 1:
+                master_ports = master_ports_by_node.setdefault(leader_ip, set())
+                master_port = ray.get(
+                    leader_ranks[0][0].select_free_port.remote(
+                        port_range_low=self._cluster.port_range_low,
+                        port_range_high=self._cluster.port_range_high,
+                        excluded_ports=sorted(master_ports),
+                    )
+                )
+                master_ports.add(master_port)
+                distributed_launch = (len(node_items), leader_ip, master_port)
+
+            leader_worker: ray.actor.ActorHandle | None = None
+            for node_rank, (node_ip, node_ranks) in enumerate(node_items):
+                is_leader = node_rank == 0
+                local_reservations = [item[0] for item in node_ranks]
+                cuda_devices = [item[1]["gpu_id"] for item in node_ranks]
+                worker_name = (
+                    group_name if is_leader else f"{group_name}-headless-{node_rank}"
+                )
+                strategy = PlacementGroupSchedulingStrategy(
+                    placement_group=placement_group,
+                    placement_group_bundle_index=bundle_indices[
+                        reservation_handles.index(local_reservations[0])
+                    ],
+                    placement_group_capture_child_tasks=True,
+                )
+                launch = None
+                if distributed_launch is not None:
+                    nnodes, master_addr, master_port = distributed_launch
+                    launch = DynamoDistributedLaunch(
+                        nnodes=nnodes,
+                        node_rank=node_rank,
+                        master_addr=master_addr,
+                        master_port=master_port,
+                        headless=not is_leader,
+                    )
                 worker = DynamoVllmWorker.options(
                     num_gpus=0,
                     runtime_env={
@@ -206,28 +294,35 @@ class FixedDynamoWorkerPool:
                             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
                         },
                     },
-                    scheduling_strategy=leader_strategy,
-                    name=group_name,
+                    scheduling_strategy=strategy,
+                    name=worker_name,
                 ).remote(
                     self._config,
                     namespace=self._namespace,
-                    group_name=group_name,
+                    group_name=worker_name,
                     cuda_devices=cuda_devices,
-                    system_port=system_port,
-                    vllm_port=vllm_port,
-                    nixl_port=nixl_port,
+                    system_port=system_port if is_leader else None,
+                    vllm_port=_vllm_port_for_node_slot(node_slots[node_ip]),
+                    nixl_port=nixl_port if is_leader else None,
                     kv_event_port=kv_event_port,
                     worker_role=worker_role,
                     manager_env=self._manager_env,
                     startup_timeout_s=self._startup_timeout_s,
                     seed=pg_index * 1024 + group_index,
-                    cleanup_reservation=reservation_handles[0],
+                    cleanup_reservation=local_reservations[0],
+                    distributed_launch=launch,
                 )
                 self._workers.append(worker)
-                self._cleanup_reservations.append(reservation_handles[0])
-                self._metadata.append({})
-                metadata_refs.append(worker.metadata.remote())
-                group_index += 1
+                self._cleanup_reservations.append(local_reservations[0])
+                if is_leader:
+                    leader_worker = worker
+                else:
+                    headless_startup_refs.append(worker.is_alive.remote())
+            assert leader_worker is not None
+            self._leader_workers.append(leader_worker)
+            self._metadata.append({})
+            metadata_refs.append(leader_worker.metadata.remote())
+            group_index += 1
 
         if group_index != len(self._worker_roles):
             raise ValueError(
@@ -235,6 +330,9 @@ class FixedDynamoWorkerPool:
                 f"configured managed worker roles: placed={group_index}, "
                 f"configured={len(self._worker_roles)}"
             )
+
+        if headless_startup_refs and not all(ray.get(headless_startup_refs)):
+            raise RuntimeError("A headless Dynamo vLLM worker exited during startup.")
 
         metadata_error: Exception | None = None
         for index, metadata_ref in enumerate(metadata_refs):
@@ -267,7 +365,7 @@ class FixedDynamoWorkerPool:
                 "Ray-managed Dynamo GPU reservation membership changed: "
                 f"expected={self._reservation_metadata}, current={current_reservations}."
             )
-        current = ray.get([worker.metadata.remote() for worker in self._workers])
+        current = ray.get([worker.metadata.remote() for worker in self._leader_workers])
         if current != expected:
             raise RuntimeError(
                 "Ray-managed Dynamo worker membership changed after NCCL collective "
@@ -302,6 +400,7 @@ class FixedDynamoWorkerPool:
             except Exception:
                 pass
         self._workers.clear()
+        self._leader_workers.clear()
         self._reservations.clear()
         self._cleanup_reservations.clear()
         self._reservation_metadata.clear()

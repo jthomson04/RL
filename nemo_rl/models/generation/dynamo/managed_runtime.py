@@ -75,10 +75,14 @@ class ManagedDynamoRuntime:
         self._config = validated_config.model_dump()
         self._dynamo_cfg = validated_config.dynamo_cfg
         self._engine_world_size = validated_config.engine_world_size
-        if self._engine_world_size > cluster.num_gpus_per_node:
+        if (
+            self._engine_world_size > cluster.num_gpus_per_node
+            and self._engine_world_size % cluster.num_gpus_per_node != 0
+        ):
             raise ValueError(
-                "Managed Dynamo requires each TP/PP engine group to fit on one "
-                f"node: tp*pp={self._engine_world_size} exceeds "
+                "Managed Dynamo multi-node engines require the same number of "
+                "ranks on every node: "
+                f"tp*pp={self._engine_world_size} is not divisible by "
                 f"cluster.num_gpus_per_node={cluster.num_gpus_per_node}"
             )
         cluster_world_size = cluster.world_size()

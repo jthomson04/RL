@@ -2,22 +2,26 @@
 
 The managed Dynamo backend owns a fixed vLLM fleet inside the Ray allocation.
 It is deliberately narrower than Dynamo itself: there is no external-runtime,
-Kubernetes, DGD, multi-node engine-group, or non-vLLM mode.
+Kubernetes, DGD, or non-vLLM mode.
 
 ## Ownership and placement
 
 Constructing `ManagedDynamoRuntime` is inert. Its explicit `start()` method
 allocates ports, launches etcd and NATS JetStream, creates one Ray-managed
-`dynamo.vllm` process per model-parallel group, and starts the frontend. A
-worker group must fit on one node. Its world size is derived from vLLM tensor
-parallelism times pipeline parallelism; expert parallelism must be either one
-or equal to tensor parallelism.
+`dynamo.vllm` engine per model-parallel group, and starts the frontend. An
+engine's world size is derived from vLLM tensor parallelism times pipeline
+parallelism; expert parallelism must be either one or equal to tensor
+parallelism. A multi-node engine has one normal process on node rank zero and
+one headless vLLM process on every other node. Each node must hold the same
+number of engine ranks.
 
 Aggregated mode creates one homogeneous backend fleet from all inference GPU
 groups. Disaggregated mode creates fixed decode and prefill pools. The pools
 have independent replica counts but share TP, PP, EP, and all other vLLM
 settings. Decode engines are ordered before prefill engines. This order is the
 fixed engine order for placement, membership checks, metrics, and refit ranks.
+Only the node-rank-zero process registers with Dynamo or exposes refit and
+metrics endpoints.
 
 Every P/D engine uses vLLM's `NixlConnector`. NeMo RL owns each engine's NIXL
 host and side-channel port. Prefill engines also receive managed KV-event

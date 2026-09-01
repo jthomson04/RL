@@ -9,8 +9,7 @@ the service ownership, startup, and weight-refit architecture.
 
 This integration is managed and vLLM-only. It does not connect to an external
 Dynamo deployment and does not support Kubernetes, DGD, SGLang, TensorRT-LLM,
-speculative decoding, quantized generation, or model-parallel engine groups
-that span nodes.
+speculative decoding, or quantized generation.
 
 ## Build the image
 
@@ -126,9 +125,9 @@ GPU count is:
 (prefill_workers + decode_workers) * tensor_parallel_size * pipeline_parallel_size
 ```
 
-Each TP times PP engine must fit on one node. Prefill and decode engines may be
-on different nodes. NeMo RL starts decode engines first and then prefill
-engines. This gives every engine a stable NCCL refit rank.
+Prefill and decode engines may be on different nodes. NeMo RL starts decode
+engines first and then prefill engines. This gives every engine a stable NCCL
+refit rank.
 
 NeMo RL manages `--disaggregation-mode`, the NIXL connector, NIXL side-channel
 ports, and prefill KV-event ports. Do not set these values in
@@ -177,11 +176,42 @@ than GRPO-specific branches.
 The fixed port layout is:
 
 - `1313-1399`: driver-local etcd and NATS control plane
+- `1400-1999`: cross-node vLLM multiprocessing rendezvous by default
 - `3000-3999`: frontend and token-wrapper HTTP endpoints
 - `4000-4099`: node-local `DYN_SYSTEM_PORT`
 - `4100-4199`: node-local NIXL side-channel ports
 - `4200-4299`: node-local prefill KV-event ports
 - `7000 + slot * 100`: node-local vLLM rendezvous ports
+
+### Multi-node engine groups
+
+Set TP times PP larger than the inference GPUs reserved per node. NeMo RL uses
+the same topology-ordered unified placement as the native vLLM backend. Node
+rank zero runs the normal Dynamo engine, and each other node runs a headless
+vLLM process. No additional Dynamo configuration is required.
+
+This example creates one TP2 aggregate engine across two nodes with one
+inference GPU on each node:
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 2
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 1
+        num_nodes: 2
+```
+
+Each engine must have the same number of reserved ranks on every participating
+node. For one TP2 prefill engine and one TP2 decode engine, keep
+`gpus_per_node: 1`, set `num_nodes: 4`, and set both disaggregation worker
+counts to one. Cross-node TP and PP need a fast NCCL transport. P/D also needs
+the existing NIXL UCX/RDMA path.
 
 ## Run the two-GPU smoke
 
