@@ -1,0 +1,251 @@
+# NT4 (Nemotron-4) Nano text-only GRPO on the single-controller path, with vLLM
+# generation.
+#
+# Why text-only for a multimodal checkpoint: the NM4 vLLM fork registers
+#   "Nemotron4ForConditionalGeneration": ("nemotron4", "Nemotron4ForCausalLM")
+# and that class is `(nn.Module, SupportsPP, IsHybrid)` -- not SupportsMultiModal.
+# Its weight mapper sends "model.vision_tower." and "model.multi_modal_projector."
+# to None, i.e. it loads the multimodal checkpoint and discards the Pixtral tower
+# and the projector. So vLLM can serve NM4's language model but has no image path
+# at all; this matches the fork's own README, which does not certify vision. Image
+# GRPO therefore has to wait for vision support upstream -- see the CLEVR sibling
+# recipe for that path, which is blocked on a separate Megatron-core protocol gap.
+#
+# This recipe exists to pipeclean everything that is not vision: NM4 model build,
+# megatron_bridge checkpoint load, Megatron -> vLLM refit across a mismatched
+# expert layout, rollout, advantage and the optimizer step.
+#
+# The parent lives under recipes/vlm/ because it carries the only NM4 training
+# block known to work (ported from Rohit's nm4_clevr_4n SFT recipe); everything
+# this file overrides is downstream of that. The parent's own `data` block is a
+# CLEVR overlay on grpo_math_1B.yaml, which is also the root of the text recipes,
+# so restoring text training is a matter of putting `data` and `env` back.
+#
+# Launch with:
+#   bash pipeclean-v2/launch_nt4nano_math_vllm_8n.sh
+# ---------------------------------------------------------------------------------
+defaults: ./nt4nano-nm4-train-base.yaml
+
+checkpointing:
+  # The weight source, which used to come from the shared parent and now lives
+  # here. The parent stopped naming one on 2026-10-09, when the VLM leaf moved
+  # to an SFT HF export and the two chains ceased to train the same checkpoint;
+  # a pretrained_checkpoint up there would land on both. The path and format
+  # are unchanged from what job 7766157 was validated on.
+  pretrained_checkpoint:
+    path: ${oc.env:NT4_NANO_CKPT_PATH,/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_post/users/sauramishra/pipeclean-v2/models/nm4_nano_bridge}
+    format: megatron_bridge
+
+policy:
+  # The parent sets this true, which builds an AutoProcessor instead of a plain
+  # tokenizer -- and `nemo_rl/data/utils.py` then forces *every* declared
+  # environment to VLMEnvironment ("vlm" if is_vlm else env_name), so the math
+  # env was constructed as a VLM env and died on the reward_functions key it
+  # does not have. The tokenizer path still points at the NT4 processor
+  # directory, which carries tokenizer.json and tokenizer_config.json, so
+  # AutoTokenizer loads it fine without the image side.
+  is_vlm: false
+  # No attention backend in this image can train NM4's head_dim 256 on packed
+  # sequences. Asking Transformer Engine directly (see
+  # pipeclean-v2/nm4-bridge/probe_attn_backend.py) gives, at head_dim 256:
+  #   cuDNN -- forward only. The backward reports no supporting backend, for
+  #            thd and sbhd alike; at head_dim 128 it trains, so the head
+  #            dimension is the constraint.
+  #   FA4   -- offered everywhere, but its SM100 forward kernel asserts on
+  #            seqused_q/seqused_k, which only thd supplies.
+  #   FA2   -- would take head_dim 256 on sm100, but is disabled for thd
+  #            whenever sequences are padded apart, which packing always does.
+  #   FA3   -- sm90 only.
+  # FlashAttention 4 on unpacked sequences is the one combination left. And
+  # megatron/setup.py requires packing whenever context parallelism is on,
+  # because CP needs cu_seqlens through PackedSeqParams -- so dropping packing
+  # means dropping CP with it. Both go, together, for that single reason.
+  #
+  # This is not how the NM4 team trains the model; it is what this image can
+  # run. Revisit when cuDNN grows a head_dim 256 backward or FA4 accepts
+  # seqused on SM100, at which point CP 16 and packing both come back.
+  sequence_packing:
+    enabled: false
+  # Nothing here needs 32 once CP is gone -- Megatron's floor drops with
+  # cp_size -- but a multiple of 32 satisfies every pad factor in play and
+  # keeps the sequence length friendly to the kernels.
+  make_sequence_length_divisible_by: 32
+  # Both training and generation now name the real NM4 HF export. The parent
+  # points this at an unrelated stand-in because AutoConfig cannot read
+  # model_type "nemotron4" and AutoBridge has no NM4 mapping; both gaps are
+  # closed by nemo_rl/models/megatron/nemotron4, which the Megatron setup
+  # imports. The export is only ever read for its config and parameter names --
+  # weights still come from the megatron_bridge checkpoint.
+  model_name: ${oc.env:NT4_NANO_HF_CKPT,/lustre/fsw/portfolios/nemotron/users/tbarnatan/models/nm4/nemotron4-nano-wsm-vlm}
+  megatron_cfg:
+    # Forced to 1 by the attention-backend situation above, not chosen. With
+    # TP1/PP1/CP1 the 64 training GPUs are all data parallel, so expert
+    # parallelism stays at the 16 the NM4 team and the Super 3.5 runs both use
+    # and the leftover factor of 4 becomes the expert-data-parallel group the
+    # distributed optimizer shards state over. That is also what pays for each
+    # rank now holding a whole 8192-token sequence rather than a sixteenth of
+    # one.
+    context_parallel_size: 1
+    # EP 16 is what the NM4 team and the Super 3.5 runs use; this run cannot
+    # afford it. Per local expert parameter a rank pays ~6 bytes that expert
+    # parallelism shards and data parallelism does not -- the bf16 weights and
+    # the fp32 gradient buffer, the latter because grad_reduce_in_fp32 is on --
+    # plus ~8 bytes of optimizer state that the distributed optimizer does
+    # shard, across expert-DP. At EP 16 on 64 training GPUs that is ~8 bytes a
+    # parameter and the step-1 forward dies with 161.3 GiB live. At EP 64 it is
+    # ~3.5. Measured, not assumed: going from 16 to 64 training GPUs at a fixed
+    # EP 16 moved the figure 164.2 -> 161.3 GiB, and widening selective
+    # recompute from four modules to seven moved it 161.32 -> 161.30, which is
+    # what says the residency is expert-sharded parameters rather than
+    # activations.
+    #
+    # 512 experts divide 64 ways into 8 a rank. The cost is that every MoE
+    # all-to-all now spans all 16 training nodes instead of staying inside
+    # four, and that expert-DP falls to 1 so the optimizer state stops
+    # sharding -- both already priced into the ~3.5 above.
+    expert_model_parallel_size: 64
+    # The parent's selective recompute list is inherited unchanged, on
+    # evidence. Full recompute is not even legal here -- NM4 sets
+    # moe_shortcut_connection and transformer_config.py rejects the pair, and
+    # the same flag bars "moe" from the selective list -- but more to the
+    # point, widening the list to seven modules (adding the architecture's own
+    # shortcut_pre_mlp_layernorm, plus layernorm and mlp) moved per-rank
+    # residency by 20 MiB in 161 GiB. Activations are not what fills this card,
+    # so the extra recompute was pure compute cost. See expert parallelism
+    # above for what actually moves the number.
+    #
+    # defer_fp32_logits stays because the Super 3.5 runs set it and it costs
+    # nothing, not because it was measured to help.
+    defer_fp32_logits: true
+    # The refit that follows a training step has to find a few GiB of packed
+    # broadcast buffer on a rank already holding the model, Muon's state and
+    # the gradient buffers. Level 2 is the only level that calls empty_cache()
+    # at the end of the step, right before that refit; at level 1 the step left
+    # 4.6 GiB reserved-but-unallocated and the 3.7 GiB buffer had 1.1 GiB to
+    # fit in. The first refit survives either way because it runs before the
+    # optimizer state exists, which is why this only shows up at step 1.
+    empty_unused_memory_level: 2
+    env_vars:
+      # Pairs with the above: empty_cache() returns whole cached blocks, so
+      # whatever is still fragmented across live allocations stays stranded.
+      # Expandable segments keep the training allocations from carving the
+      # arena up in the first place.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    model_overrides:
+      # FlashAttention 4 cannot run here at all: its SM100 head_dim 256 kernel
+      # calls quack.activation.sub_packed_f32x2, and the image's quack-kernels
+      # 0.6.5 has no packed-f32x2 helpers whatsoever. That is the same version
+      # skew that broke the vLLM router warmups, surfacing a third time.
+      # Version 2 is the only other build present (flash-attn 2.8.1, with its
+      # compiled extension), and Transformer Engine permits head_dim 256 on
+      # sm100 for it.
+      #
+      # This has to be a top-level override rather than a saved_args entry.
+      # The provider is itself the language TransformerConfig, and it picks up
+      # flash_attention_version from the *checkpoint's* args once, in
+      # __post_init__ via _transformer_config_from_args; the saved_args dict we
+      # pass here is only ever read for keys the mimo providers name
+      # explicitly, which for this field is the mimo_vision_encoder_ one alone.
+      # So saved_args.flash_attention_version is a dead key for the language
+      # model, and the checkpoint's own 4 survives.
+      flash_attention_version: 2
+      saved_args:
+        # The three keys below came down from the shared parent until
+        # 2026-10-09. They moved here when the VLM leaf changed provider:
+        # saved_args is read only by the ExperimentalNM4 family
+        # (experimental_nm4_provider.py:51), which is this chain and no longer
+        # that one, and the plain Nemotron4VLModelProvider rejects the key.
+        # Values are unchanged from what job 7766157 was validated on.
+        #
+        # `auto`, not `flash`: it lets TE fall back to the cuDNN fused backend
+        # rather than pinning a flash build that may have no usable kernel for
+        # the inputs in play (job 7773889 died that way on the VLM chain).
+        attention_backend: auto
+        flash_attention_version: 2
+        mimo_vision_encoder_attention_backend: auto
+        # set_attention_backend writes NVTE_FLASH_ATTN_V* process-wide from
+        # each config it sees and asserts on disagreement, so the vision tower
+        # has to name the same version as the language model even though this
+        # run never uses it.
+        mimo_vision_encoder_flash_attention_version: 2
+  generation:
+    backend: "vllm"
+    # The parent pins refit_transport=mcore, which moves weights Megatron to
+    # Megatron and never needs HF names. No vLLM transport can do that: they all
+    # export through AutoBridge.export_hf_weights, which is what the NM4 bridge
+    # now makes possible.
+    refit_transport: null
+    model_name: ${policy.model_name}
+    # The image ships nvidia-cutlass-dsl 4.6.2 against quack-kernels 0.6.5, and
+    # quack still imports `cutlass.base_dsl.enums.Arch`, which 4.6.2 moved to
+    # `cutlass.base_dsl.arch`. Every warmup path that reaches quack therefore
+    # dies with ModuleNotFoundError before the engine finishes starting. Both
+    # paths are pure ahead-of-time compilation of MoE router GEMMs, so turning
+    # them off costs first-token latency and nothing else.
+    vllm_kwargs:
+      kernel_config:
+        enable_jit_warmup: false
+        enable_cutedsl_warmup: false
+    vllm_cfg:
+      async_engine: true
+      # The parallelism the NM4 team validated (`vllm serve --tensor-parallel-size 2`).
+      # Experts shard across the TP ranks; EP stays 1, matching their serving config.
+      tensor_parallel_size: 2
+      expert_parallel_size: 1
+      # ~194 GB of bf16 weights over TP2 is ~97 GB per GPU. The 0.6 default leaves
+      # too little of a 189 GB GB200 for KV cache once weights land.
+      gpu_memory_utilization: 0.85
+    colocated:
+      enabled: false
+      resources:
+        # 16 nodes, as in the Super 3.5 runs. Far more generation capacity than
+        # 64 rollouts a step needs; it is here to keep the training half at 16
+        # nodes, which is the part that was out of memory.
+        num_nodes: 16
+        gpus_per_node: 4
+
+# Back to text: the parent's CLEVR overlay is replaced by the math task from
+# grpo_math_1B.yaml at the root of both chains. The parent's `env.clevr-cogent`
+# block is left declared but unused, since `env_name` selects math.
+data:
+  train:
+    dataset_name: OpenMathInstruct-2
+    split_validation_size: 0.05
+    seed: ${grpo.seed}
+  validation: null
+  default:
+    prompt_file: "examples/prompts/cot.txt"
+    system_prompt_file: null
+    processor: "math_hf_data_processor"
+    env_name: "math"
+
+env:
+  math:
+    num_workers: 8
+    math_verify_impl: "hf_math_verify"
+
+grpo:
+  max_num_steps: 5
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+
+cluster:
+  gpus_per_node: 4
+  # Matches the Super 3.5 runs' footprint: 32 nodes split 16 training / 16
+  # generation.
+  #
+  # The split is what makes this fit. At 4 training nodes the 16 GPUs were all
+  # consumed by EP16, leaving an expert-data-parallel group of size 1, so the
+  # distributed optimizer had nothing to shard expert state across; each rank
+  # carried ~14 bytes per local parameter and hit 164 GiB of the 184 GiB card,
+  # with the post-step refit then unable to find even 78 MiB for its broadcast
+  # buffer. At 16 training nodes the same EP16 leaves expert-DP = 64/16 = 4, so
+  # the fp32 main weights and Muon momentum shard four ways and the per-rank
+  # figure drops to roughly 8 bytes per parameter.
+  num_nodes: 32
+  segment_size: 8
+
+logger:
+  log_dir: logs/grpo-nt4nano-math-32n4g-vllm-single-controller-async
+  wandb:
+    name: grpo-nt4nano-math-32n4g-vllm-single-controller-async

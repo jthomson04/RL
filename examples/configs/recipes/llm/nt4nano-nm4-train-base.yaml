@@ -1,0 +1,355 @@
+# NT4 (Nemotron-4) Nano CLEVR GRPO on the single-controller path.
+#
+# The model is a ~93B hybrid Mamba/MoE multimodal checkpoint: 72 layers, hidden
+# 3072, 512 experts at top-k 10, MTP depth 2, squared-ReLU, RMSNorm, no position
+# embedding (the hybrid layers carry position), and a Pixtral vision tower. None
+# of that is read from `policy.model_name` -- for `megatron_bridge` format the
+# provider comes from the checkpoint's own run_config.yaml, which names
+# `megatron.bridge.models.experimental_nm4_llava_provider.ExperimentalNM4LlavaProvider`.
+#
+# The training block below is ported from Rohit's nm4_clevr_4n.yaml on
+# rohitrango/NeMo-RL @ rohit/sft_v2_up_n4, which is the only configuration known
+# to have trained this checkpoint (Slurm jobs 4079404/4083225). That recipe is
+# SFT; everything under `policy.generation` here is new, because no one has run
+# NT4 generation in NeMo-RL yet. Treat the generation block as unvalidated.
+#
+# Requires Megatron-Bridge at e5629351 (liding/Megatron-Bridge, branch
+# rohit/nm4-mlm-to-bridge) for the provider, and a venv built with
+# FlashAttention 4. The bridge commit pinned on this branch does not contain it.
+# ---------------------------------------------------------------------------------
+defaults: ../vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml
+
+checkpointing:
+  # No pretrained_checkpoint here, deliberately. This file is shared with the
+  # text RLVR recipe, and the two chains no longer train the same checkpoint:
+  # the VLM leaf loads guyueh's SFT HF export through policy.model_name, while
+  # the text leaf still loads the nm4_nano_bridge Megatron checkpoint. A weight
+  # source set here lands on both, and on 2026-10-09 that is exactly what went
+  # wrong -- removing it for the VLM chain silently repointed the text chain's
+  # weights and broke its provider. Each leaf names its own.
+  #
+  # Checkpointing is on: a long run that dies without one loses everything. The
+  # megatron_cfg.checkpoint block below is what makes the write cheap enough to
+  # leave on.
+  enabled: true
+  # Relative, matching this chain's logger.log_dir convention. Named explicitly
+  # because the inherited default is the CLEVR exemplar's
+  # results/nemo-rl-omni/nemotron-omni-clevr-megatron-8n4g, which this chain
+  # would otherwise write its text-RLVR checkpoints into.
+  checkpoint_dir: results/nt4nano-nm4-train
+
+policy:
+  # NM4 Nano ships no HF config of its own. Rohit's recipe points model_name at an
+  # unrelated model purely to satisfy AutoConfig/AutoBridge in
+  # finalize_megatron_setup(); the resulting bridge object is only consumed on the
+  # HF-export refit path, which refit_transport=mcore bypasses. Mirrored here.
+  model_name: ${oc.env:NT4_NANO_HF_CONFIG,/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_post/users/sauramishra/pipeclean-v2/models/Mistral-Medium-3.5-128B}
+  tokenizer:
+    # Verified against the checkpoint: eos/pad ids 2/3 match its
+    # null_tokenizer_eod_id/null_tokenizer_pad_id, and the highest token id 262143
+    # falls inside padded_vocab_size 262272.
+    name: ${oc.env:NT4_NANO_PROCESSOR,/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_post/users/sauramishra/pipeclean-v2/models/nt4-nano-processor}
+    chat_template: default
+  is_vlm: true
+  precision: bfloat16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  # 8192 is the checkpoint's seq_length and max_position_embeddings, so this is the
+  # ceiling without extending RoPE. Rohit trains at 65536, which CLEVR does not need
+  # and which would make rollouts needlessly expensive.
+  max_total_sequence_length: 8192
+  # 1, and it must stay 1 for as long as sequence packing is on -- the two are
+  # coupled through the attention backend. Any value above 1 pads each packed
+  # sequence, which sets TE's `pad_between_seqs`, which in turn is the exact
+  # condition that disables FlashAttention 2 for THD ("Disabling FlashAttention
+  # 2 for qkv_format = thd when there is padding between sequences"). That
+  # leaves only cuDNN, and cuDNN has no *backward* kernel for this model's
+  # attention: with NVTE_DEBUG on, job 7774600 showed `is_training` as the one
+  # and only field distinguishing the rejected call from the accepted ones --
+  # head_dim 256, padding_causal, pad_between_seqs and cp_size 16 are all
+  # otherwise fine. Hence logprobs passed and the training microbatch did not.
+  make_sequence_length_divisible_by: 1
+  # Computes next-token logprobs in slices instead of materializing the whole
+  # [tokens x vocab] tensor at once. Unset here until now, which is why job
+  # 7775014's OOM landed in prepare_loss_input: with CP16 the sequence was split
+  # across ranks and each held a sixteenth of those logits, and CP=1 handed one
+  # rank all 8192 positions at once.
+  #
+  # 1024 is the common value across the comparable recipes -- the 120B Nemotron
+  # Super GRPO configs, the omni VLM MPO ones and the Super 3.5 VLM parity
+  # recipe all sit between 1024 and 2048.
+  logprob_chunk_size: 1024
+  sequence_packing:
+    enabled: true
+    # Quantile balancing and chunkwise CP cannot consume a packed MoE mask yet.
+    mask_padding_from_moe: false
+
+  megatron_cfg:
+    checkpoint:
+      # async_save keeps the write off the training critical path;
+      # ckpt_assume_constant_structure enables torch_dist save-plan caching
+      # (it sets use_cached_ckpt_structure).
+      async_save: true
+      ckpt_assume_constant_structure: true
+      # Stage tensors through CPU shared memory instead of letting the async
+      # writer map them over CUDA IPC. On the IPC path the persistent writer
+      # holds a second device-side copy of the trainer's tensors, which is what
+      # exhausted GPU memory at the first async save on NM4 MIMO. Requires the
+      # Megatron-Bridge pin at f1d353d12 or later (MR !44); on earlier pins the
+      # field is accepted and silently ignored.
+      async_ckpt_use_cpu_shm: true
+    # TP is pinned to 1 by the architecture, not by preference: num_query_groups is 1
+    # and Megatron requires it to be divisible by the tensor parallel size.
+    tensor_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 16
+    # 1, not 16. CP>1 forces per-sequence padding inside the packed batch (see
+    # make_sequence_length_divisible_by above), and that padding is what leaves
+    # TE with no trainable attention backend for this model.
+    #
+    # CP=16 came in with the rest of the training block ported from Rohit's
+    # nm4_clevr_4n, but that is an *SFT* recipe: it was never validated in this
+    # combination -- GRPO, this container's TE, and NeMo-RL's packed THD batches
+    # together. The two configurations that are exercised here both run CP=1:
+    # the omni VLM recipe this one inherits from (packing on, CP defaulted) and
+    # the 32-node NT4 text recipe. Dropping to 1 joins them, and gives DP=16
+    # over the same 16 GPUs.
+    #
+    # If 8192-token samples turn out not to fit without CP, the fix is to turn
+    # sequence packing off rather than to raise CP again -- unpacked batches are
+    # not THD, so they never set pad_between_seqs and FA2 stays available.
+    context_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    recompute_granularity: selective
+    recompute_modules:
+      - residual_stream
+      - moe_act
+      - gdp_in_proj
+      - gdp_qkv
+    freeze_vision_encoder: false
+    freeze_vision_projector: false
+    # This is the one setup.py reads into `model_cfg.attention_backend`; see the
+    # matching note on model_overrides.saved_args.attention_backend below for
+    # why pinning `flash` leaves TE with nothing it can use under CP 16 + THD.
+    attention_backend: auto
+    # Required by `logprob_chunk_size` above -- setup.py asserts the pair, and
+    # the two are the same optimisation: deferring the fp32 cast is what lets
+    # each chunk be converted on its own instead of promoting the entire
+    # [tokens x vocab] tensor to fp32 up front. Setting the chunk size without
+    # this is what stopped job 7775313 at worker init. The base config defaults
+    # it False; the omni VLM recipes that chunk all turn it on.
+    defer_fp32_logits: true
+    moe_router_dtype: fp32
+    moe_router_fusion: true
+    moe_router_load_balancing_type: quantile_balancing
+    moe_router_bias_update_rate: 0.001
+    moe_permute_fusion: true
+    moe_grouped_gemm: true
+    moe_token_dispatcher_type: alltoall
+    moe_aux_loss_coeff: 0.0
+    apply_rope_fusion: false
+    bias_activation_fusion: false
+    gradient_accumulation_fusion: false
+    use_gloo_process_groups: false
+    use_fused_weighted_squared_relu: true
+    mtp_num_layers: 2
+    mtp_loss_scaling_factor: 0.3
+    mtp_use_repeated_layer: true
+    # No vision recompute keys: those are RADIO tower controls on the Nemotron
+    # Omni provider. ExperimentalNM4LlavaProvider drives a Pixtral tower and has
+    # no such fields, and setting one is a hard error in setup_model_config.
+    env_vars:
+      # This model runs with single-digit GiB to spare, so fragmentation is the
+      # difference between fitting and not: job 7775454 died needing 1.00 GiB
+      # while holding 5.76 GiB reserved-but-unallocated, which is the exact case
+      # PyTorch's own OOM message says to use expandable segments for.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      FLA_TILELANG: '0'
+      NVTE_CUTEDSL_FUSED_GROUPED_MLP: '1'
+      NVTE_USE_CUTLASS_GROUPED_GEMM: '0'
+      NVTE_FWD_LAYERNORM_SM_MARGIN: '40'
+      NVTE_BWD_LAYERNORM_SM_MARGIN: '40'
+      NVTE_INF_LAYERNORM_SM_MARGIN: '40'
+      OMP_NUM_THREADS: '16'
+      UB_TIMEOUT: '720'
+      NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: '128'
+    # Passed through to the provider. These are properties of the checkpoint, not
+    # tuning knobs -- changing them changes the model.
+    model_overrides:
+      moe_router_score_function: sigmoid
+      moe_router_topk: 10
+      num_moe_experts: 512
+      moe_router_topk_scaling_factor: 3.16
+      moe_router_quantile_balancing_estimation_scope: global_batch
+      moe_router_qb_num_bins: 1000
+      moe_router_quantile_balancing_ema: 0.0
+      moe_router_pre_softmax: false
+      moe_router_enable_expert_bias: false
+      moe_router_skip_muon: true
+      linear_cp_mode: chunkwise
+      linear_cp_layout: contiguous
+      # The checkpoint was trained with this on, but transformer_impl=
+      # inference_optimized rejects a padded routing map, and this run is bf16
+      # throughout, so no quantization alignment is needed on either side.
+      moe_router_padding_for_quantization: false
+      # fp8_cfg.enabled: false only declines to *enable* fp8; it leaves the
+      # provider's own fp8 fields untouched, so this checkpoint's fp8=e4m3 and
+      # fp8_recipe=mxfp8 would survive. The mxfp8 recipe plus
+      # transformer_impl=inference_optimized also makes refit try to quantize
+      # weights during the reshard. Clear both so the run is bf16 end to end.
+      fp8: null
+      fp8_recipe: blockwise
+      # FA2, not the checkpoint's 4, for the same reason the 32-node text recipe
+      # pins 2: the image ships quack-kernels 0.6.5 against nvidia-cutlass-dsl
+      # 4.6.2, and FA4's softmax calls `quack.activation.sub_packed_f32x2`,
+      # which that quack does not define (its `activation` module exports no
+      # packed helpers at all). Job 7773570 died there in the ViT's attention.
+      #
+      # This has to be a top-level override rather than a saved_args entry. The
+      # provider is itself the language TransformerConfig and reads
+      # flash_attention_version from the *checkpoint's* args once, in
+      # __post_init__; saved_args is only consulted for keys the mimo providers
+      # name explicitly, which for this field is the mimo_vision_encoder_ one
+      # alone. So saved_args.flash_attention_version is a dead key for the
+      # language model and the checkpoint's 4 would survive.
+      flash_attention_version: 2
+      # No saved_args block here either, and for the same reason as
+      # pretrained_checkpoint above: it is only meaningful to one of the two
+      # chains. saved_args is read by the ExperimentalNM4 provider family
+      # (experimental_nm4_provider.py:51), which the text leaf still uses via
+      # its Megatron checkpoint; the VLM leaf's Nemotron4VLModelProvider has no
+      # such field and rejects the key outright. The four entries that lived
+      # here have moved to the text recipe, unchanged.
+    optimizer:
+      # Muon is what Rohit's runs used for this checkpoint; moe_router_skip_muon
+      # above keeps the router on Adam.
+      optimizer: muon
+      lr: 1.5e-05
+      min_lr: 2.0e-06
+      weight_decay: 0.1
+      muon_momentum: 0.9
+      muon_split_qkv: true
+      muon_extra_scale_factor: 0.2
+      muon_scale_mode: spectral
+      muon_coefficient_type: polar_express
+      muon_scalar_optimizer: adam
+      muon_expert_tp_mode: layer_sharded
+      use_distributed_optimizer: true
+      # The layer-wise path asserts every optimizer param appears in a DDP
+      # param layout, and one GDP projection in this model does not. Muon does
+      # not require it, so use the regular distributed optimizer instead.
+      use_layer_wise_distributed_optimizer: false
+      # Megatron asserts precision-aware optimizer is adam-only, and the
+      # checkpoint's own run_config trained muon with it off and fp32 moments.
+      # store_param_remainders is a precision-aware feature, so it goes too.
+      use_precision_aware_optimizer: false
+      store_param_remainders: false
+      exp_avg_dtype: float32
+      exp_avg_sq_dtype: float32
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true
+      # Must track context_parallel_size. `no_shard` arrived with the rest of
+      # the port from Rohit's SFT recipe and was free there: CP16 x TP1 x PP1
+      # over 16 GPUs leaves DP=1, and sharding across one rank is a no-op. CP=1
+      # makes DP=16, at which point `no_shard` means all 16 ranks each keep a
+      # full copy of the optimizer state -- muon with fp32 moments, so 12 bytes
+      # per dense parameter, replicated sixteen times. That is what put job
+      # 7775014 at 182.93 GiB of a 184.31 GiB GPU before it OOMed.
+      #
+      # Every other config in this repo uses optim_grads_params, including the
+      # defaults the validated 32-node NT4 text recipe inherits by not setting
+      # this block at all.
+      data_parallel_sharding_strategy: optim_grads_params
+
+  generation:
+    max_new_tokens: 1024
+    mcore_generation_config:
+      # The generic VLM wrapper rather than the omni one: NM4's vision tower is
+      # Pixtral (processor_config.json declares PixtralProcessor with patch_size 14,
+      # spatial_merge_size 2), so the omni wrapper's RADIO assumptions do not hold.
+      # VLMInferenceWrapper handles imgs_sizes dynamic resolution. The subclass
+      # restores the supports_* flags this Megatron-core pin predates; without
+      # them the worker treats generation as text-only and passes the whole
+      # NM4LlavaModel to code that expects a bare language model.
+      # UNVALIDATED -- no NT4 generation has been run in NeMo-RL.
+      megatron_inference_wrapper: nemo_rl.models.generation.megatron.inference_wrappers.VLMInferenceWrapperWithModalities
+      image_dynamic_resolution: true
+      # Mirror the training expert layout so refit needs no expert resharding.
+      tensor_model_parallel_size: 1
+      expert_model_parallel_size: 16
+      expert_tensor_parallel_size: 1
+      context_parallel_size: 1
+      max_tokens: ${policy.max_total_sequence_length}
+      # The training config recomputes 'residual_stream', whose checkpoint
+      # manager runs outside graph capture, so Megatron requires graphs off.
+      # The inference cfg inherits recompute_modules from training, so the
+      # parent's 'local' is not usable here.
+      cuda_graph_impl: none
+      # Megatron only allows the 'none' scope once graphs are off.
+      inference_cuda_graph_scope: none
+      # This Megatron-core pin predates the 'hybrid' spacing the parent uses.
+      # Inert with graphs off, but the value is still parsed into the enum.
+      cuda_graph_sizing_distribution: exponential
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 4
+
+grpo:
+  max_num_steps: 5
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+
+data:
+  default:
+    # NT4's chat template emits "<|im_start|>assistant\n<think>\n" for the generation
+    # prompt when enable_thinking is on (its default), so the completion starts inside
+    # the reasoning block. The prompt therefore asks the model to close </think> rather
+    # than to open <think>, which clevr_cogent_cot.txt does and would double up.
+    #
+    # Consequence for reward: format_reward looks for <think>...</think> in the
+    # response, and the opening tag lives in the prompt, so its 0.25 component is
+    # unreachable here. That is cosmetic rather than a bug -- it is constant across
+    # every sample in a group, so it cancels in the GRPO advantage and only shifts the
+    # logged reward.
+    prompt_file: examples/prompts/clevr_cogent_cot_nt4nano.txt
+
+cluster:
+  gpus_per_node: 4
+  # 4 training nodes (16 GPUs: TP1 x CP1 x PP1, so DP16, with EP16 sharding the
+  # experts across them) plus 4 generation nodes. Rohit's nm4_clevr_4n spent the
+  # same 16 GPUs as CP16; see context_parallel_size above for why that does not
+  # survive here.
+  num_nodes: 8
+  segment_size: null
+
+logger:
+  # The chain inherits `wandb_enabled: false` from grpo_math_1B.yaml and nothing
+  # between here and there turns it back on, so the project and name below have
+  # been inert since this recipe was written -- every run so far, including the
+  # 24-node smoke that passed 5/5 steps, left metrics only in the driver log and
+  # TensorBoard. Enabled here rather than in a child recipe so the smoke and the
+  # full-scale run land in the same project and stay comparable.
+  wandb_enabled: true
+  wandb:
+    project: nemo-rl-nt4nano
+    # Pinned to `nvidia` as of 2026-10-09. Left unset until then, which meant
+    # the key's default entity decided, and that default is `joc` -- where
+    # every VLM run so far has landed, alongside the known-good 86-node text
+    # baseline (REPRODUCE.md).
+    #
+    # The risk of naming an entity is that wandb.init raises if the key cannot
+    # write to it, taking the run down at startup. That risk was checked
+    # rather than assumed: this key lists 10,937 projects under `nvidia`, and
+    # job 1169022's run was relocated there successfully
+    # (nvidia/nemo-rl-nt4nano/mzebp75v) before this line was written.
+    #
+    # Runs logged before this change live under joc and have to be moved by
+    # re-syncing their offline directory with `wandb sync --no-skip-online
+    # --entity nvidia`; there is no move API, and the UI only moves between
+    # projects within one entity.
+    entity: nvidia
+    name: nt4nano-clevr-grpo-pipeclean
