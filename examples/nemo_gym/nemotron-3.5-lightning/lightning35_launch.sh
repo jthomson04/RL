@@ -767,6 +767,10 @@ _seed_cache "\$CACHE_READ/triton_cache.tar.zst" "\$LOCAL_TRI" "Triton"
 
 echo "[CACHE SEED] Done."
 SETUPEOF
+# Extra per-node setup appended for this launch; it runs in each Ray container before Ray starts.
+if [[ -n "${EXTRA_SETUP_COMMAND:-}" ]]; then
+  SETUP_COMMAND+=$'\n'"${EXTRA_SETUP_COMMAND}"
+fi
 export SETUP_COMMAND
 
 # =============================================================================
