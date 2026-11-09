@@ -19,6 +19,14 @@ from typing import Optional, Tuple
 import torch
 from transformers import AutoConfig
 
+from nemo_rl.models.huggingface.nemotron4 import register_nemotron4_config
+
+# NM4 exports declare model_type "nemotron4" but carry no modeling code and no
+# auto_map, so every AutoConfig.from_pretrained below would raise on them. The
+# flag checks here run before vLLM is imported, so we cannot rely on the fork's
+# own registration.
+register_nemotron4_config()
+
 
 @dataclass
 class FlashAttentionKwargs:
