@@ -973,6 +973,7 @@ SBATCH_OUTPUT=$(sbatch \
     ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
     ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
     ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
+    "${SLURM_COMMENT_ARGS[@]}" \
     "${BATCH_SCRIPT}")
 
 echo "${SBATCH_OUTPUT}"
