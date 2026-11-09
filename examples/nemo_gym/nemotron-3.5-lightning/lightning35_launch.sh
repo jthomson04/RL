@@ -76,7 +76,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(realpath "${SCRIPT_DIR}/../../..")"
 
-CONFIG_PATH="examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml"
+CONFIG_PATH="${CONFIG_PATH:-examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml}"
 NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-32}"
 NUM_GEN_NODES="${NUM_GEN_NODES:-32}"
 NUM_GYM_NODES="${NUM_GYM_NODES:-2}"
@@ -210,6 +210,20 @@ nl2bash_vllm_args=(
 )
 [[ "${NL2BASH_ENABLE_EXPERT_PARALLEL}" == "1" ]] && nl2bash_vllm_args+=(--enable-expert-parallel)
 external_vllm_pool_args NL2BASH "${nl2bash_vllm_args[@]}"
+
+# The pool definitions above are tuned for this deployment's GPU count and
+# device capability. Other deployments reusing this launcher need to adjust
+# them without forking it, so source an override file last: both
+# external_vllm_pool_env and external_vllm_pool_args append, and the replica
+# applies env assignments and vLLM arguments in order, so the last value wins.
+if [[ -n "${EXTERNAL_VLLM_POOL_OVERRIDES:-}" ]]; then
+  if [[ ! -f "${EXTERNAL_VLLM_POOL_OVERRIDES}" ]]; then
+    echo "ERROR: EXTERNAL_VLLM_POOL_OVERRIDES does not exist: ${EXTERNAL_VLLM_POOL_OVERRIDES}" >&2
+    exit 1
+  fi
+  echo "  Pool overrides: ${EXTERNAL_VLLM_POOL_OVERRIDES}"
+  source "${EXTERNAL_VLLM_POOL_OVERRIDES}"
+fi
 
 RAY_SUB="${RAY_SUB:-${PROJECT_ROOT}/ray.sub}"
 BATCH_SCRIPT="${BATCH_SCRIPT:-${PROJECT_ROOT}/tools/external_gym_vllm/run_in_allocation.sh}"
@@ -769,6 +783,10 @@ EXTERNAL_SERVICE_READINESS_ARG=""
 if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
   EXTERNAL_SERVICE_READINESS_ARG="${EXTERNAL_SERVICE_READINESS_PLACEHOLDER}"
 fi
+# The runner is a knob because the two are not interchangeable: the legacy
+# run_grpo_nemo_gym.py needs grpo.async_grpo, the SingleController's
+# run_grpo_single_controller.py rejects it. Default stays legacy.
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-./examples/nemo_gym/run_grpo_nemo_gym.py}"
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 if compgen -G \"${RUN_DIR}/setup_failures/vllm_patch_*\" >/dev/null; then \
   echo '[VLLM PATCH] ERROR: setup failed on one or more nodes:' >&2; \
@@ -795,7 +813,9 @@ NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
 HF_TOKEN=\${HF_TOKEN:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
-uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
+${NEMO_RL_DYNAMO_BIN_DIR:+NEMO_RL_DYNAMO_BIN_DIR=${NEMO_RL_DYNAMO_BIN_DIR}} \
+VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/tmp/nemo_rl_\${SLURM_JOB_ID:-manual}_fi_autotune_\$(date +%s) \
+uv run ${TRAIN_SCRIPT} \
 --config ${CONFIG_PATH} \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \

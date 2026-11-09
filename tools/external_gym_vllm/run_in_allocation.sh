@@ -713,7 +713,9 @@ else
   lb_node="${external_nodes[0]}"
 fi
 lb_mounts="${MOUNTS},${EXTERNAL_VLLM_TOOLS_DIR_HOST}:/opt/external-vllm-tools:ro"
-external_service_mount="${EXTERNAL_VLLM_SHARED_ROOT}:${EXTERNAL_VLLM_SHARED_ROOT}"
+# The pools run serve_vllm_on_ray.py, which is NeMo RL code calling NeMo RL's
+# vLLM source patches; give them the job's code overlay too.
+external_service_mount="${EXTERNAL_VLLM_SHARED_ROOT}:${EXTERNAL_VLLM_SHARED_ROOT}${MOUNTS:+,${MOUNTS}}"
 for pool in "${pool_names[@]}"; do
   lb_mounts+=",${state_dirs[${pool}]}:${lb_state_dirs[${pool}]}"
 done
