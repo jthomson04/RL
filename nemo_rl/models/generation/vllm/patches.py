@@ -1018,6 +1018,71 @@ def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
     logger.info("Successfully disabled decoder-level SP-MoE for GLM DSA models.")
 
 
+def _patch_vllm_cutedsl_available_requires_quack(logger) -> None:
+    """Widen the cuteDSL availability probes to cover ``quack``.
+
+    ``is_available`` imports only ``cutlass`` and ``cutlass.cute``, but the
+    compile path it guards goes on to import ``quack.compile_utils``. When a
+    container pairs quack-kernels 0.6.5 with an nvidia-cutlass-dsl that no
+    longer exposes ``cutlass.base_dsl.enums``, ``quack`` raises on import while
+    the probe still reports the kernels as available. The ll_bf16 router GEMM
+    warmup is gated only on ``has_device_capability(90)`` -- no kernel-config
+    flag reaches it -- so on any MoE model with a bf16 ``GateLinear`` that
+    mismatch aborts engine startup instead of falling back.
+
+    Importing ``quack`` in the probe is a no-op where the pair is consistent
+    and restores the supported "kernel unavailable" path where it is not.
+    Remove once the container ships a matching quack / cutlass-dsl pair.
+    """
+    marker = "import quack.compile_utils  # noqa: F401"
+    # (file, indent) -- ll_bf16's probe is a module-level function, skinny
+    # gemm's is a staticmethod, so the try bodies sit at different depths.
+    probes = (
+        ("model_executor/kernels/linear/cute_dsl/ll_bf16.py", " " * 8),
+        ("model_executor/kernels/linear/cute_dsl/skinny_gemm.py", " " * 12),
+    )
+
+    for relative_path, indent in probes:
+        try:
+            file_to_patch = _get_vllm_file(relative_path)
+        except RuntimeError:
+            logger.warning(
+                "Could not locate %s for the cuteDSL availability patch.",
+                relative_path,
+            )
+            continue
+
+        old_snippet = (
+            f"{indent}import cutlass.cute  # noqa: F401\n"
+            f"\n"
+            f"{indent}_cutedsl_available = True\n"
+        )
+        new_snippet = (
+            f"{indent}import cutlass.cute  # noqa: F401\n"
+            f"{indent}{marker}\n"
+            f"\n"
+            f"{indent}_cutedsl_available = True\n"
+        )
+
+        with _locked_file_patch(file_to_patch) as (content, write_back):
+            if new_snippet in content:
+                logger.info(
+                    "cuteDSL availability patch already applied to %s.",
+                    relative_path,
+                )
+                continue
+            if old_snippet not in content:
+                logger.warning(
+                    "Could not apply the cuteDSL availability patch: expected "
+                    "source shape was not found in %s.",
+                    file_to_patch,
+                )
+                continue
+            write_back(content.replace(old_snippet, new_snippet, 1))
+
+        logger.info("Patched the cuteDSL availability probe in %s.", relative_path)
+
+
 def _patch_vllm_moe_routed_experts_capture(logger, *, required: bool = False) -> bool:
     """Fire the routed-experts capture hook on the monolithic fused-MoE path.
 
@@ -1375,6 +1440,7 @@ def _apply_vllm_patches(
     _patch_vllm_radio_native_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
+    _patch_vllm_cutedsl_available_requires_quack(patch_logger)
     _patch_vllm_moe_routed_experts_capture(
         patch_logger, required=require_moe_routed_experts_capture
     )
