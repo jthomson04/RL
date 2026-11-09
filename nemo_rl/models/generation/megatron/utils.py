@@ -13,11 +13,14 @@
 # limitations under the License.
 
 from dataclasses import replace
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
-from megatron.core.inference.config import ImageProcessingConfig, VideoProcessingConfig
+from megatron.core.inference.config import ImageProcessingConfig
 from megatron.core.inference.utils import device_memory_summary
+
+if TYPE_CHECKING:
+    from megatron.core.inference.config import VideoProcessingConfig
 
 
 def sample_vision_tensors(data, index: int):
@@ -243,11 +246,16 @@ def build_video_preprocessing_config(
     generation_config: dict[str, Any],
     *,
     frame_manifest_magic: bytes,
-) -> VideoProcessingConfig | None:
+) -> "VideoProcessingConfig | None":
     """Build video preprocessing when explicitly enabled by generation config."""
     video_num_frames = generation_config.get("video_num_frames")
     if image_config is None or video_num_frames is None:
         return None
+
+    # Deferred: video preprocessing is opt-in, and VideoProcessingConfig is newer
+    # than some pinned Megatron-core branches. Importing it at module scope made
+    # image-only runs fail on those pins.
+    from megatron.core.inference.config import VideoProcessingConfig
 
     # Video configs.
     video_kwargs: dict[str, Any] = {}

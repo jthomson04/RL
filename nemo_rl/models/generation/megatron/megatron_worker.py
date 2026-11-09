@@ -48,9 +48,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
 from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
-from megatron.core.resharding.copy_services.nccl_m2n_copy_service import (
-    NCCLM2NCopyService,
-)
 from megatron.core.resharding.refit import (
     prepare_swap_model_weights,
     swap_model_weights,
@@ -1674,6 +1671,13 @@ class MegatronGenerationRefitMixin:
 
             self.refit_copy_service = NVSHMEMCopyService(group=self.refit_pg)
         elif refit_backend == "nccl_m2n":
+            # Deferred for the same reason as nvshmem: this copy service is newer
+            # than some pinned Megatron-core branches, so importing it eagerly
+            # breaks every other backend on those pins.
+            from megatron.core.resharding.copy_services.nccl_m2n_copy_service import (
+                NCCLM2NCopyService,
+            )
+
             self.refit_copy_service = NCCLM2NCopyService(group=self.refit_pg)
         elif refit_backend == "nccl":
             self.refit_copy_service = NCCLCopyService(group=self.refit_pg)
