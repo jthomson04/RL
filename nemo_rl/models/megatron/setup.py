@@ -99,6 +99,11 @@ from nemo_rl.utils.path_utils import (
     path_isdir,
 )
 
+# Registers the NM4 HF config and weight bridge. NM4 exports carry no modeling
+# code and no auto_map, so without this AutoConfig cannot read them and
+# AutoBridge has no mapping to export their weights with.
+import nemo_rl.models.megatron.nemotron4  # noqa: E402,F401
+
 _HF_CONFIG_PATCHED = False
 
 _NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT = "expanded_sequence_v1"
