@@ -3149,6 +3149,14 @@ class SingleControllerActor:
                         with self._timer.time("offload_before_refit"):
                             await asyncio.to_thread(self._trainer.offload_before_refit)
                     else:
+                        # The refit has to stage weights into a packed broadcast
+                        # buffer on a rank that just finished a training step, so
+                        # park the optimizer first -- exactly as the deferred branch
+                        # above does before its save. prepare_for_training brings it
+                        # back at the top of the next step. Gated worker-side by
+                        # offload_optimizer_for_refit.
+                        with self._timer.time("offload_before_refit"):
+                            await asyncio.to_thread(self._trainer.offload_before_refit)
                         # Named to match async GRPO's refit phase: training cannot
                         # proceed and generation is serving stale weights, so the
                         # same seconds are idle on both fleets.
