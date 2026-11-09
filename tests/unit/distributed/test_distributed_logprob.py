@@ -142,6 +142,74 @@ def _run_logprob_forward_and_backward(rank, world_size, tp_size, chunk_size):
     )
 
 
+def _run_logprob_backward_chunk_bytes(rank, world_size, tp_size):
+    """Bound how many bytes per chunk element the chunked backward may use.
+
+    ``chunk_size`` exists so the backward's working set can be traded against
+    speed, which only holds if the per-chunk cost is the fp32 temporaries the
+    knob is reasoned about. Deriving the chosen-token indicator with
+    ``torch.nn.functional.one_hot`` broke that: it returns int64, so each chunk
+    also carried 8 bytes per vocabulary entry for the one-hot and 8 more for the
+    mask multiply. Nothing about the result changed, so the correctness tests
+    above stayed green, and the cost only surfaced as a CUDA OOM once the
+    vocabulary reached 262272 entries.
+
+    Measuring two chunk sizes and taking the difference cancels the fixed terms
+    (``grad_input`` and the accumulated ``.grad``, both full-sequence), leaving
+    just the per-chunk slope. The ceiling is a tripwire for an int64
+    vocabulary-width intermediate, not a tight budget for the fp32 working set.
+    """
+    tp_group = torch.distributed.new_group(ranks=list(range(tp_size)))
+
+    batch_size = 1
+    seq_len = 96
+    full_vocab_size = 16384
+    vocab_part_size = full_vocab_size // tp_size
+    vocab_start_index = rank * vocab_part_size
+    vocab_end_index = (rank + 1) * vocab_part_size
+
+    def peak_backward_bytes(chunk_size):
+        torch.manual_seed(42)
+        vocab_parallel_logits = torch.randn(
+            batch_size,
+            seq_len,
+            vocab_part_size,
+            device="cuda",
+            requires_grad=True,
+        )
+        target = torch.randint(
+            0, full_vocab_size, (batch_size, seq_len), device="cuda"
+        )
+        loss = ChunkedDistributedLogprob.apply(
+            vocab_parallel_logits,
+            target,
+            vocab_start_index,
+            vocab_end_index,
+            chunk_size,
+            tp_group,
+            False,
+        ).sum()
+
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        before = torch.cuda.memory_allocated()
+        loss.backward()
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated() - before
+
+    small, large = 8, 40
+    growth = peak_backward_bytes(large) - peak_backward_bytes(small)
+    bytes_per_element = growth / (batch_size * (large - small) * vocab_part_size)
+
+    # fp32 temporaries alone are a handful of bytes per element; the int64
+    # formulation measured above 30.
+    assert 0 < bytes_per_element < 20, (
+        f"chunked logprob backward grew {bytes_per_element:.1f} bytes per chunk "
+        f"element between chunk_size {small} and {large}; an int64 "
+        "vocabulary-width intermediate has likely returned"
+    )
+
+
 def _run_log_softmax(rank, world_size, tp_size):
     """Test _compute_distributed_log_softmax against PyTorch baseline."""
     tp_group = torch.distributed.new_group(ranks=list(range(tp_size)))
@@ -255,6 +323,12 @@ def test_distributed_log_softmax(distributed_test_runner, tp_size):
 def test_distributed_logprob_edge_cases(distributed_test_runner):
     test_fn = functools.partial(_run_edge_cases, tp_size=2)
     distributed_test_runner(test_fn, world_size=2)
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_chunked_logprob_backward_per_chunk_bytes(distributed_test_runner, tp_size):
+    test_fn = functools.partial(_run_logprob_backward_chunk_bytes, tp_size=tp_size)
+    distributed_test_runner(test_fn, world_size=tp_size)
 
 
 # ---------------------------------------------------------------------------

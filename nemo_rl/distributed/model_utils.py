@@ -301,7 +301,6 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         chunk_size = ctx.chunk_size
         tp_group = ctx.tp_group
 
-        partition_vocab_size = int(vocab_parallel_logits.shape[-1])
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
@@ -323,28 +322,38 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             logits = vocab_parallel_logits[:, chunk_start:chunk_end, :]
             logits = logits.to(dtype=torch.float32)
 
-            softmax_output = _compute_distributed_log_softmax(
+            # The gradient is (is_chosen - softmax), and the softmax buffer can
+            # carry it: negate in place, then add the indicator at the chosen
+            # vocabulary index. Building that indicator with
+            # torch.nn.functional.one_hot instead costs chunk * partition_vocab
+            # elements of int64, again for the bool multiply that masks it, and
+            # a third time in fp32 for the subtraction. At a 262272-entry
+            # vocabulary that transient, not the logits, is the largest
+            # allocation in this backward: it is what put jobs 7762681 and
+            # 7765260 out of memory, the latter asking for exactly the 1.00 GiB
+            # a 512-token chunk of it occupies.
+            chunk_grad_fp32 = _compute_distributed_log_softmax(
                 logits,
                 group=tp_group,
+            ).exp()
+            chunk_grad_fp32.neg_()
+            # src is 1 where the position contributes and 0 where it is masked,
+            # which reproduces the masked one-hot: a masked row adds 0.0, and
+            # masked_target already holds 0 for targets outside this partition.
+            chunk_grad_fp32.scatter_add_(
+                -1,
+                masked_target[:, chunk_start:chunk_end].unsqueeze(-1),
+                (~(target_mask[:, chunk_start:chunk_end]))
+                .unsqueeze(-1)
+                .to(chunk_grad_fp32.dtype),
             )
-            softmax_output = softmax_output.exp()
-
-            # 1 if it's the chosen log prob, 0 otherwise
-            is_chosen = (~(target_mask[:, chunk_start:chunk_end])).unsqueeze(
-                -1
-            ) * torch.nn.functional.one_hot(
-                masked_target[:, chunk_start:chunk_end],
-                num_classes=partition_vocab_size,
-            )
-
-            chunk_grad_fp32 = is_chosen.float().sub_(softmax_output)
             chunk_grad_fp32.mul_(
                 grad_output[:, chunk_start:chunk_end].unsqueeze(dim=-1)
             )
             grad_input[:, chunk_start:chunk_end, :].copy_(chunk_grad_fp32)
 
             # Explicitly free before next iteration allocates
-            del softmax_output, is_chosen, logits, chunk_grad_fp32
+            del logits, chunk_grad_fp32
 
         # if you add an argument to the forward method, then you must add a corresponding None here
         return grad_input, None, None, None, None, None, None, None
