@@ -1,8 +1,8 @@
 [submodule "3rdparty/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
-	url = https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
-	branch = main
-	shallow = true
+	url = https://gitlab-master.nvidia.com/sauramishra/Megatron-Bridge.git
+	branch = nm4-mlm-to-bridge-with-nemotron4
+
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
 	url = https://github.com/NVIDIA-NeMo/Automodel.git
