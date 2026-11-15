@@ -269,7 +269,9 @@ class LoadBalancer:
         # use as much of that pool as load balancing requires.
         self._proxy_session = aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(limit=5000, limit_per_host=0),
-            timeout=aiohttp.ClientTimeout(total=1800),
+            # NT4 Nano 16K/lag 8 (HSG 8860778): above GenRM's judge_request_timeout_s (7200), so a queued judge call is
+            # never timed out here first, which also quarantined the backend and turned the backlog into 503s.
+            timeout=aiohttp.ClientTimeout(total=7500),
         )
         await self.pool.start()
 
