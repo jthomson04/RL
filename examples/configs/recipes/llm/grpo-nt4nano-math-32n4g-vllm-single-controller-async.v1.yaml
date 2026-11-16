@@ -35,6 +35,12 @@ checkpointing:
   pretrained_checkpoint:
     path: ${oc.env:NT4_NANO_CKPT_PATH,/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_post/users/sauramishra/pipeclean-v2/models/nm4_nano_bridge}
     format: megatron_bridge
+  # This NeMo-RL's SingleController rejects val: checkpoint metrics, and the
+  # recipe has no validation loop.
+  metric_name: null
+  # With checkpointing on, this NeMo-RL's in_order sampler requires the data
+  # plane in the checkpoint.
+  save_data_plane: true
 
 policy:
   # The parent sets this true, which builds an AutoProcessor instead of a plain
@@ -131,38 +137,25 @@ policy:
       # Expandable segments keep the training allocations from carving the
       # arena up in the first place.
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    # Job 7766157 ran with the ViT frozen and flash attention, resolved through
+    # the fork's VLM parent; this file's copy from pipeline d06125e says
+    # otherwise. Set them as 7766157 ran: an unfrozen ViT costs about 1.5 GiB of
+    # fp32 gradients and optimizer state per rank, which the 24-node smoke could
+    # not afford (8788671). FA2 itself is set in the parent, as
+    # flash_attention_version.
+    freeze_vision_encoder: true
+    attention_backend: flash
     model_overrides:
-      # FlashAttention 4 cannot run here at all: its SM100 head_dim 256 kernel
-      # calls quack.activation.sub_packed_f32x2, and the image's quack-kernels
-      # 0.6.5 has no packed-f32x2 helpers whatsoever. That is the same version
-      # skew that broke the vLLM router warmups, surfacing a third time.
-      # Version 2 is the only other build present (flash-attn 2.8.1, with its
-      # compiled extension), and Transformer Engine permits head_dim 256 on
-      # sm100 for it.
-      #
-      # This has to be a top-level override rather than a saved_args entry.
-      # The provider is itself the language TransformerConfig, and it picks up
-      # flash_attention_version from the *checkpoint's* args once, in
-      # __post_init__ via _transformer_config_from_args; the saved_args dict we
-      # pass here is only ever read for keys the mimo providers name
-      # explicitly, which for this field is the mimo_vision_encoder_ one alone.
-      # So saved_args.flash_attention_version is a dead key for the language
-      # model, and the checkpoint's own 4 survives.
-      flash_attention_version: 2
       saved_args:
         # The three keys below came down from the shared parent until
         # 2026-10-09. They moved here when the VLM leaf changed provider:
         # saved_args is read only by the ExperimentalNM4 family
         # (experimental_nm4_provider.py:51), which is this chain and no longer
         # that one, and the plain Nemotron4VLModelProvider rejects the key.
-        # Values are unchanged from what job 7766157 was validated on.
-        #
-        # `auto`, not `flash`: it lets TE fall back to the cuDNN fused backend
-        # rather than pinning a flash build that may have no usable kernel for
-        # the inputs in play (job 7773889 died that way on the VLM chain).
-        attention_backend: auto
+        # `flash`, as 7766157 ran (see above).
+        attention_backend: flash
         flash_attention_version: 2
-        mimo_vision_encoder_attention_backend: auto
+        mimo_vision_encoder_attention_backend: flash
         # set_attention_backend writes NVTE_FLASH_ATTN_V* process-wide from
         # each config it sees and asserts on disagreement, so the vision tower
         # has to name the same version as the language model even though this

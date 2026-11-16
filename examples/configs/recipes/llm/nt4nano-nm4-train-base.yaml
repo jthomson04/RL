@@ -141,6 +141,12 @@ policy:
     # this is what stopped job 7775313 at worker init. The base config defaults
     # it False; the omni VLM recipes that chunk all turn it on.
     defer_fp32_logits: true
+    # FA2, not the checkpoint's 4, for the same reason the 32-node text recipe
+    # pins 2: the image ships quack-kernels 0.6.5 against nvidia-cutlass-dsl
+    # 4.6.2, and FA4's softmax calls `quack.activation.sub_packed_f32x2`,
+    # which that quack does not define (its `activation` module exports no
+    # packed helpers at all). Job 7773570 died there in the ViT's attention.
+    flash_attention_version: 2
     moe_router_dtype: fp32
     moe_router_fusion: true
     moe_router_load_balancing_type: quantile_balancing
@@ -201,20 +207,10 @@ policy:
       # weights during the reshard. Clear both so the run is bf16 end to end.
       fp8: null
       fp8_recipe: blockwise
-      # FA2, not the checkpoint's 4, for the same reason the 32-node text recipe
-      # pins 2: the image ships quack-kernels 0.6.5 against nvidia-cutlass-dsl
-      # 4.6.2, and FA4's softmax calls `quack.activation.sub_packed_f32x2`,
-      # which that quack does not define (its `activation` module exports no
-      # packed helpers at all). Job 7773570 died there in the ViT's attention.
+      # FA2 (not the checkpoint's 4) is set as policy.megatron_cfg.flash_attention_version
+      # below: this NeMo-RL has that first-class key and refuses
+      # model_overrides.flash_attention_version alongside it.
       #
-      # This has to be a top-level override rather than a saved_args entry. The
-      # provider is itself the language TransformerConfig and reads
-      # flash_attention_version from the *checkpoint's* args once, in
-      # __post_init__; saved_args is only consulted for keys the mimo providers
-      # name explicitly, which for this field is the mimo_vision_encoder_ one
-      # alone. So saved_args.flash_attention_version is a dead key for the
-      # language model and the checkpoint's 4 would survive.
-      flash_attention_version: 2
       # No saved_args block here either, and for the same reason as
       # pretrained_checkpoint above: it is only meaningful to one of the two
       # chains. saved_args is read by the ExperimentalNM4 provider family
