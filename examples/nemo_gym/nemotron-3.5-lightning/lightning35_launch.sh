@@ -291,6 +291,12 @@ ln -sfn "$(realpath "${RUN_DIR}")" "${RESULTS_DIR}/runs/latest"
 # topology probes, attach scripts, etc.).
 export BASE_LOG_DIR="${BASE_LOG_DIR:-${RESULTS_DIR}/ray_logs}"
 
+# post-training/pipeline's NT4 Nano recipe on this NeMo-RL with the image built for the NT4 fork; see
+# ../nt4-nano-pipeline/README.md.
+if [[ -n "${NRL_VENV_OVERLAY_DIR:-}" ]]; then
+  source "${SCRIPT_DIR}/../nt4-nano-pipeline/overlay.sh"
+fi
+
 # =============================================================================
 # SLURM configuration
 # =============================================================================
